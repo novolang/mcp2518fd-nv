@@ -303,13 +303,14 @@ pub trait FdLink
 // ── Bit timing ───────────────────────────────────────────────────────
 //
 // A bit is a synchronisation segment of 1 time quantum, TSEG1 quanta
-// (propagation and phase 1) and TSEG2 quanta (phase 2); a quantum is
-// BRP / SYSCLK, so the rate is SYSCLK / (BRP * (1 + TSEG1 + TSEG2)).  The
-// sample point is at the end of TSEG1.  The nominal phase has BRP 1 to 256,
-// TSEG1 2 to 256, TSEG2 1 to 128 and 4 to 385 quanta a bit (Reference
-// Manual Table 3-3); the data phase has BRP 1 to 256, TSEG1 1 to 32, TSEG2 1
-// to 16 and 3 to 49 quanta a bit (Table 3-4).  The registers hold each
-// length less one (Registers 3-8 and 3-9).
+// (the propagation segment and phase segment 1) and TSEG2 quanta (phase
+// segment 2); a quantum is BRP / SYSCLK, so the rate is
+// SYSCLK / (BRP * (1 + TSEG1 + TSEG2)).  The sample point is at the end of
+// TSEG1.  The nominal phase has BRP 1 to 256, TSEG1 2 to 256, TSEG2 1 to
+// 128 and 4 to 385 quanta a bit (Reference Manual Table 3-3); the data
+// phase has BRP 1 to 256, TSEG1 1 to 32, TSEG2 1 to 16 and 3 to 49 quanta a
+// bit (Table 3-4).  The registers hold each length less one (Registers 3-8
+// and 3-9).
 
 // One phase's bit timing, in whole time quanta.  `brp` 0 means that no
 // timing fits.
