@@ -1,0 +1,1994 @@
+// mcp2518fd_tests — the driver over a double of the part: a byte-addressed
+// memory behind the SPI instructions RESET, READ and WRITE, with the
+// registers' reset values (DS20006027B, Tables 3-1 and 3-2), the mode
+// change that takes a few reads, the oscillator that becomes ready after a
+// few reads, the transmit queue, the transmit FIFO, the receive FIFO and the
+// transmit event FIFO each with a head or tail that moves when the control
+// register's UINC bit is written, the user address and status registers
+// those pointers produce, and a RAM that counts a read or write that is not
+// a multiple of 4 bytes at a word-aligned address (Section 4.2).  The log
+// keeps what the controller sent, in a form the tests compare.
+//
+// Log entries: one SPI transaction is the bytes sent, the number of bytes
+// read back and -1.
+//
+// The RAM layout the double assumes is the one the driver configures: the
+// transmit event FIFO at offset 0 (8 objects of 8 bytes), the transmit queue
+// at 64 (4 objects of 72 bytes), the receive FIFO 1 at 352 (16 objects of 72
+// bytes) and the transmit FIFO 2 at 1504 (4 objects of 72 bytes).
+//
+// The numbers are worked out by hand from the data sheet.  The identifier
+// 0x18DAF110 is a 29-bit extended identifier: its top 11 bits, SID, are
+// 0x18DAF110 >> 18 = 0x636, and its low 18 bits, EID, are 0x2F110, so the T0
+// word is EID << 11 | SID = 0x17888000 | 0x636 = 0x17888636, which goes out
+// as the bytes 0x36 0x86 0x88 0x17.
+
+use std.test
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut, CanBus, CanBusFrame, CanBusErrors, AsyncEdge }
+use dev_bus.{ DeviceWiring, AsyncDeviceReady }
+use canframe
+use canframe.{ CanFdFrame }
+use dev_bus
+use mcp2518fd
+use mcp2518fd.{ Mcp2518, Mcp2518Config, Mcp2518Timing, Mcp2518Event, FdLink, SpiBuf }
+use mcp2518fd_irq
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `mem` is the byte memory by address: the CAN module's registers from 0x000,
+// the RAM from 0x400, the part's own registers from 0xE00.  `ro` lists
+// addresses that ignore a write.  `st` is the double's state: 1 is 1 when a
+// part is there, 2 the mode now (OPMOD), 3 the mode requested, 4 the reads of
+// CiCON byte 2 still to show the old mode, 5 the resets seen, 6 the reads
+// that still answer 0 after a reset, 7 and 8 the transmit queue's count and
+// head, 9 its request bit, 10 and 11 the receive FIFO's count and tail, 12
+// and 13 the transmit FIFO's count and head, 14 its request bit, 15 and 16
+// the transmit event FIFO's count and tail, 17 the last SPI clock asked for,
+// 18 the number of times the bus was made ready, 19 the first clock asked
+// for, 20 the RAM accesses that were not word multiples, 21 the microseconds
+// waited, 22 the ECC enable, 23 the reads of OSC that still show it not
+// ready, 24 the reads of CiCON byte 3 that still show ABAT, 25 the bytes
+// written to RAM, 30 the GPIO levels (bit 0 and 1), 40 the INT pin level,
+// 41 is 1 when the wiring has a chip select, 50 the byte an absent part
+// reads as, 51 is 1 when the oscillator never becomes ready, 99 the entries
+// in the log.
+
+struct Chip
+    mem: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// Makes `n` bytes from `a` ignore writes.
+fn freeze(c: Chip, a: Int, n: Int)
+    for i in 0..n
+        c.ro.insert(a + i, 1)
+
+fn mem_get(c: Chip, a: Int) -> Int
+    at(c.mem, a)
+
+fn word_get(c: Chip, a: Int) -> Int
+    mem_get(c, a) | (mem_get(c, a + 1) << 8) | (mem_get(c, a + 2) << 16) | (mem_get(c, a + 3) << 24)
+
+fn word_set(c: Chip, a: Int, v: Int)
+    c.mem.insert(a, v & 0xFF)
+    c.mem.insert(a + 1, (v >> 8) & 0xFF)
+    c.mem.insert(a + 2, (v >> 16) & 0xFF)
+    c.mem.insert(a + 3, (v >> 24) & 0xFF)
+
+// The registers at their reset values.
+fn power_on(c: Chip)
+    word_set(c, 0x000, 0x04980760)
+    word_set(c, 0x004, 0x003E0F0F)
+    word_set(c, 0x008, 0x000E0303)
+    word_set(c, 0x00C, 0x00021000)
+    word_set(c, 0x01C, 0)
+    word_set(c, 0x034, 0)
+    word_set(c, 0x040, 0)
+    word_set(c, 0x050, 0)
+    word_set(c, 0x05C, 0)
+    word_set(c, 0x068, 0)
+    for k in 0..8
+        word_set(c, 0x1D0 + 4 * k, 0)
+    for k in 0..2
+        word_set(c, 0x1F0 + 8 * k, 0)
+        word_set(c, 0x1F4 + 8 * k, 0)
+    word_set(c, 0xE00, 0x00000060)
+    word_set(c, 0xE04, 0x03000003)
+    word_set(c, 0xE0C, 0)
+    word_set(c, 0xE10, 0)
+    word_set(c, 0xE14, 0x00000011)
+    c.st.insert(2, 4)
+    c.st.insert(3, 4)
+    c.st.insert(4, 0)
+    for k in 7..17
+        c.st.insert(k, 0)
+
+fn chip() -> Chip
+    let c = Chip { mem: HashMap.new(), ro: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    power_on(c)
+    c.st.insert(1, 1)
+    c.st.insert(40, 1)
+    c.st.insert(41, 1)
+    c.st.insert(50, 0xFF)
+    c
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The reset: every register returns to its reset value, the module is in
+// Configuration mode, the oscillator restarts, and the next reads answer 0.
+fn reset_all(c: Chip)
+    c.st.insert(5, at(c.st, 5) + 1)
+    power_on(c)
+    c.st.insert(24, 0)
+    if at(c.st, 60) == 1
+        word_set(c, 0x000, 0)
+    c.st.insert(6, 3)
+
+// A read of one byte.
+fn read_byte(c: Chip, a: Int) -> Int
+    // CiCON byte 2: OPMOD in bits 7:5, TXQEN and STEF below.
+    if a == 0x002
+        let left = at(c.st, 4)
+        if left > 0
+            c.st.insert(4, left - 1)
+        else
+            c.st.insert(2, at(c.st, 3))
+        return (at(c.st, 2) << 5) | (mem_get(c, a) & 0x1F)
+    // CiCON byte 3: REQOP and ABAT.
+    if a == 0x003
+        let left = at(c.st, 24)
+        if left > 0
+            c.st.insert(24, left - 1)
+            return mem_get(c, a) | 0x08
+        return mem_get(c, a) & 0xF7
+    // CiTXREQ.
+    if a == 0x030
+        var v = 0
+        if at(c.st, 9) == 1 and at(c.st, 7) > 0
+            v = v | 1
+        if at(c.st, 14) == 1 and at(c.st, 12) > 0
+            v = v | 4
+        return v
+    if a >= 0x031 and a <= 0x033
+        return 0
+    // CiINT flags: the FIFO flags follow the FIFOs.
+    if a == 0x01C
+        var v = mem_get(c, a)
+        if at(c.st, 10) > 0
+            v = v | 0x02
+        if at(c.st, 15) > 0
+            v = v | 0x10
+        return v
+    // CiTEFSTA, CiTEFUA.
+    if a == 0x044
+        if at(c.st, 15) > 0
+            return 1
+        return 0
+    if a >= 0x045 and a <= 0x047
+        return 0
+    if a >= 0x048 and a <= 0x04B
+        return ((at(c.st, 16) * 8) >> (8 * (a - 0x048))) & 0xFF
+    // CiTXQSTA, CiTXQUA.
+    if a == 0x054
+        var v = 0
+        if at(c.st, 7) < 4
+            v = v | 1
+        if at(c.st, 7) == 0
+            v = v | 4
+        return v
+    if a >= 0x055 and a <= 0x057
+        return 0
+    if a >= 0x058 and a <= 0x05B
+        return ((64 + at(c.st, 8) * 72) >> (8 * (a - 0x058))) & 0xFF
+    // CiFIFOSTA1, CiFIFOUA1.
+    if a == 0x060
+        if at(c.st, 10) > 0
+            return 1
+        return 0
+    if a == 0x061
+        return (at(c.st, 11) + at(c.st, 10)) % 16
+    if a == 0x062 or a == 0x063
+        return 0
+    if a >= 0x064 and a <= 0x067
+        return ((352 + at(c.st, 11) * 72) >> (8 * (a - 0x064))) & 0xFF
+    // CiFIFOSTA2, CiFIFOUA2.
+    if a == 0x06C
+        var v = 0
+        if at(c.st, 12) < 4
+            v = v | 1
+        if at(c.st, 12) == 0
+            v = v | 4
+        return v
+    if a >= 0x06D and a <= 0x06F
+        return 0
+    if a >= 0x070 and a <= 0x073
+        return ((1504 + at(c.st, 13) * 72) >> (8 * (a - 0x070))) & 0xFF
+    // OSC: ready after a few reads, unless the test says never.
+    if a == 0xE01
+        if at(c.st, 51) == 1
+            return 0
+        let left = at(c.st, 23)
+        if left > 0
+            c.st.insert(23, left - 1)
+            return 0
+        var v = 0x04
+        if (mem_get(c, 0xE00) & 1) != 0
+            v = v | 0x01
+        return v
+    // IOCON byte 2: the GPIO levels.
+    if a == 0xE06
+        return at(c.st, 30) & 3
+    mem_get(c, a)
+
+// A write of one byte.
+fn write_byte(c: Chip, a: Int, v: Int)
+    if at(c.ro, a) == 1
+        return
+    if a >= 0x400 and a <= 0xBFF
+        c.st.insert(25, at(c.st, 25) + 1)
+    // CiCON byte 3: a mode request, and ABAT.
+    if a == 0x003
+        c.st.insert(3, v & 7)
+        c.st.insert(4, 2)
+        c.mem.insert(a, v & 0x07)
+        if (v & 0x08) != 0
+            c.st.insert(9, 0)
+            c.st.insert(14, 0)
+            c.st.insert(7, 0)
+            c.st.insert(12, 0)
+            c.st.insert(24, 2)
+            if at(c.st, 61) == 1
+                c.st.insert(24, 100000)
+        return
+    // UINC and TXREQ of the transmit queue (CiTXQCON byte 1).
+    if a == 0x051
+        c.mem.insert(a, v & 0xFC)
+        if (v & 1) != 0
+            c.st.insert(8, (at(c.st, 8) + 1) % 4)
+            c.st.insert(7, at(c.st, 7) + 1)
+        if (v & 2) != 0
+            c.st.insert(9, 1)
+        return
+    // UINC and TXREQ of the transmit FIFO (CiFIFOCON2 byte 1).
+    if a == 0x069
+        c.mem.insert(a, v & 0xFC)
+        if (v & 1) != 0
+            c.st.insert(13, (at(c.st, 13) + 1) % 4)
+            c.st.insert(12, at(c.st, 12) + 1)
+        if (v & 2) != 0
+            c.st.insert(14, 1)
+        return
+    // UINC of the receive FIFO (CiFIFOCON1 byte 1).
+    if a == 0x05D
+        c.mem.insert(a, v & 0xFC)
+        if (v & 1) != 0
+            c.st.insert(11, (at(c.st, 11) + 1) % 16)
+            if at(c.st, 10) > 0
+                c.st.insert(10, at(c.st, 10) - 1)
+        return
+    // UINC of the transmit event FIFO (CiTEFCON byte 1).
+    if a == 0x041
+        c.mem.insert(a, v & 0xFC)
+        if (v & 1) != 0
+            c.st.insert(16, (at(c.st, 16) + 1) % 8)
+            if at(c.st, 15) > 0
+                c.st.insert(15, at(c.st, 15) - 1)
+        return
+    // OSC byte 0: the clock starts.
+    if a == 0xE00
+        c.st.insert(23, 2)
+    // ECCCON byte 0.
+    if a == 0xE0C
+        c.st.insert(22, v & 1)
+    // IOCON byte 1: the latches drive the pins.
+    if a == 0xE05
+        c.st.insert(30, v & 3)
+    c.mem.insert(a, v & 0xFF)
+
+struct FakeLink
+    c: Chip
+
+impl FdLink for FakeLink
+    fn link_xfer(self, tx: SpiBuf, n: Int, var dst: SpiBuf) -> Bool [hw]
+        let c = self.c
+        for b in tx
+            log_push(c, b as Int)
+        log_push(c, n)
+        log_push(c, -1)
+        dst.clear()
+        if at(c.st, 41) == 0 or tx.len() < 2
+            return false
+        let cmd = tx[0] as Int >> 4
+        let addr = ((tx[0] as Int & 0xF) << 8) | tx[1] as Int
+        if at(c.st, 1) == 0
+            for _i in 0..n
+                let _ = dst.push(at(c.st, 50) as u8)
+            return true
+        if cmd == 0 and addr == 0 and tx.len() == 2
+            reset_all(c)
+            return true
+        if cmd == 3
+            if at(c.st, 6) > 0
+                c.st.insert(6, at(c.st, 6) - 1)
+                for _i in 0..n
+                    let _ = dst.push(0)
+                return true
+            if addr >= 0x400 and addr <= 0xBFF and (addr % 4 != 0 or n % 4 != 0)
+                c.st.insert(20, at(c.st, 20) + 1)
+            for i in 0..n
+                let _ = dst.push(read_byte(c, addr + i) as u8)
+            return true
+        if cmd == 2
+            if addr >= 0x400 and addr <= 0xBFF and (addr % 4 != 0 or (tx.len() - 2) % 4 != 0)
+                c.st.insert(20, at(c.st, 20) + 1)
+            for i in 2..tx.len()
+                write_byte(c, addr + i - 2, tx[i] as Int)
+            return true
+        false
+
+    fn link_wait(self, us: Int) [hw]
+        self.c.st.insert(21, at(self.c.st, 21) + us)
+
+    fn link_irq(self) -> Int [hw]
+        at(self.c.st, 40)
+
+    fn link_setup(self, hz: Int) -> Bool [hw]
+        let c = self.c
+        if at(c.st, 18) == 0
+            c.st.insert(19, hz)
+        c.st.insert(18, at(c.st, 18) + 1)
+        c.st.insert(17, hz)
+        if at(c.st, 62) > 0 and at(c.st, 18) > at(c.st, 62)
+            return false
+        at(c.st, 41) == 1
+
+@tier(app)
+fn link(c: Chip) -> FakeLink
+    FakeLink { c: c }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn int_or(o: ?Int) -> Int
+    match o
+        Some(v) => v
+        None    => -999999
+
+fn bytes_of(xs: [Int]) -> SpiBuf
+    var b: SpiBuf = Vec.new()
+    for x in xs
+        let _ = b.push(x as u8)
+    b
+
+// ── Message objects in RAM ───────────────────────────────────────────
+
+// Puts an object in the receive FIFO at its head: the two header words and
+// the data bytes, and counts it.
+fn rx_put(c: Chip, r0: Int, r1: Int, data: [Int])
+    let idx = (at(c.st, 11) + at(c.st, 10)) % 16
+    let base = 0x400 + 352 + idx * 72
+    word_set(c, base, r0)
+    word_set(c, base + 4, r1)
+    for i in 0..data.len()
+        c.mem.insert(base + 8 + i, data[i])
+    c.st.insert(10, at(c.st, 10) + 1)
+
+// The word at `off` of the object at the TX queue's slot `slot`.
+fn txq_word(c: Chip, slot: Int, off: Int) -> Int
+    word_get(c, 0x400 + 64 + slot * 72 + off)
+
+fn txf_word(c: Chip, slot: Int, off: Int) -> Int
+    word_get(c, 0x400 + 1504 + slot * 72 + off)
+
+// The bus sends what the transmit queue holds: each object becomes a transmit
+// event and, when `loop` is set, a frame in the receive FIFO, and the queue
+// is empty.
+@tier(app)
+fn bus_send(c: Chip, echo: Bool)
+    let n = at(c.st, 7)
+    for k in 0..n
+        let slot = (at(c.st, 8) + 4 - n + k) % 4
+        let t0 = txq_word(c, slot, 0)
+        let t1 = txq_word(c, slot, 4)
+        let eidx = (at(c.st, 16) + at(c.st, 15)) % 8
+        word_set(c, 0x400 + eidx * 8, t0)
+        word_set(c, 0x400 + eidx * 8 + 4, t1)
+        c.st.insert(15, at(c.st, 15) + 1)
+        if echo
+            var data: [Int] = []
+            for i in 0..64
+                list.push(data, mem_get(c, 0x400 + 64 + slot * 72 + 8 + i))
+            rx_put(c, t0, t1 & 0x1FF, data)
+    c.st.insert(7, 0)
+    c.st.insert(9, 0)
+
+// ── The constants and the tables ─────────────────────────────────────
+
+@test
+fn test_the_layout_fits_the_ram() [io, hw]
+    test.assert_eq(mcp2518fd.RAM_START, 0x400)
+    test.assert_eq(mcp2518fd.RAM_SIZE, 2048)
+    test.assert_eq(mcp2518fd.OBJECT_BYTES, 8 + mcp2518fd.PAYLOAD_BYTES)
+    // Equation 3-17 to 3-20: a TEF object of 8 bytes, and 72 bytes for each
+    // of the others.
+    let used = mcp2518fd.TEF_DEPTH * 8 + (mcp2518fd.TXQ_DEPTH + mcp2518fd.RXF_DEPTH + mcp2518fd.TXF_DEPTH) * 72
+    test.assert_eq(used, mcp2518fd.RAM_USED)
+    test.assert_eq(used, 1792)
+    test.assert(used <= mcp2518fd.RAM_SIZE)
+
+@test
+fn test_the_modes_and_flags_are_the_data_sheets() [io, hw]
+    test.assert_eq(mcp2518fd.MCP_MODE_NORMAL_FD, 0)
+    test.assert_eq(mcp2518fd.MCP_MODE_SLEEP, 1)
+    test.assert_eq(mcp2518fd.MCP_MODE_LOOPBACK, 2)
+    test.assert_eq(mcp2518fd.MCP_MODE_LISTEN, 3)
+    test.assert_eq(mcp2518fd.MCP_MODE_CONFIG, 4)
+    test.assert_eq(mcp2518fd.MCP_MODE_LOOPBACK_EXT, 5)
+    test.assert_eq(mcp2518fd.MCP_MODE_NORMAL_20, 6)
+    test.assert_eq(mcp2518fd.MCP_MODE_RESTRICTED, 7)
+    test.assert_eq(mcp2518fd.CON_RESET, 0x04980760)
+    test.assert_eq(mcp2518fd.INT_TXIF, 0x0001)
+    test.assert_eq(mcp2518fd.INT_RXIF, 0x0002)
+    test.assert_eq(mcp2518fd.INT_TBCIF, 0x0004)
+    test.assert_eq(mcp2518fd.INT_MODIF, 0x0008)
+    test.assert_eq(mcp2518fd.INT_TEFIF, 0x0010)
+    test.assert_eq(mcp2518fd.INT_ECCIF, 0x0100)
+    test.assert_eq(mcp2518fd.INT_SPICRCIF, 0x0200)
+    test.assert_eq(mcp2518fd.INT_TXATIF, 0x0400)
+    test.assert_eq(mcp2518fd.INT_RXOVIF, 0x0800)
+    test.assert_eq(mcp2518fd.INT_SERRIF, 0x1000)
+    test.assert_eq(mcp2518fd.INT_CERRIF, 0x2000)
+    test.assert_eq(mcp2518fd.INT_WAKIF, 0x4000)
+    test.assert_eq(mcp2518fd.INT_IVMIF, 0x8000)
+
+@test
+fn test_the_default_settings() [io, hw]
+    let c = mcp2518fd.config_default()
+    test.assert_eq(c.mode, 0)
+    test.assert(not c.pll)
+    test.assert_eq(c.spi_hz, 10000000)
+    test.assert_eq(c.retries, 0)
+    test.assert(c.accept_all)
+    test.assert_eq(c.irq_mask, mcp2518fd.INT_RXIF)
+    test.assert(not c.int_pins)
+    test.assert_eq(c.sample_nominal, 800)
+    test.assert_eq(c.sample_data, 800)
+
+// ── Bit timing ───────────────────────────────────────────────────────
+
+@test
+fn test_the_reference_manuals_example_is_500k_and_2m_at_40_mhz() [io, hw]
+    // Tables 3-3 to 3-5: NBRP 1, NTSEG1 63, NTSEG2 16, NSJW 16 and DBRP 1,
+    // DTSEG1 15, DTSEG2 4, DSJW 4, which the registers hold less one.
+    let n = mcp2518fd.nominal_timing(40000000, 500000, 800)
+    test.assert_eq(n.brp, 1)
+    test.assert_eq(n.tseg1, 63)
+    test.assert_eq(n.tseg2, 16)
+    test.assert_eq(n.sjw, 16)
+    test.assert_eq(mcp2518fd.nbt_bits(n), 0x003E0F0F)
+    let d = mcp2518fd.data_timing(40000000, 2000000, 800)
+    test.assert_eq(d.brp, 1)
+    test.assert_eq(d.tseg1, 15)
+    test.assert_eq(d.tseg2, 4)
+    test.assert_eq(d.sjw, 4)
+    test.assert_eq(mcp2518fd.dbt_bits(d), 0x000E0303)
+    // Table 3-5's register values: TSEG1 62 and 14, TSEG2 15 and 3.
+    test.assert_eq((mcp2518fd.nbt_bits(n) >> 16) & 0xFF, 62)
+    test.assert_eq((mcp2518fd.dbt_bits(d) >> 16) & 0x1F, 14)
+    // And the transmitter delay compensation: automatic, offset 15.
+    test.assert_eq(mcp2518fd.tdc_bits(2000000, d), 0x00020F00)
+
+@test
+fn test_the_table_for_the_two_crystals_equals_the_solver() [io, hw]
+    for fsys in [40000000, 20000000]
+        for rate in [500000, 1000000]
+            let t = mcp2518fd.nominal_timing(fsys, rate, 800)
+            test.assert_eq(mcp2518fd.nbt_bits(t), mcp2518fd.timing_known(fsys, rate))
+            test.assert_eq(mcp2518fd.timing_rate(fsys, t), rate)
+            test.assert_eq(mcp2518fd.timing_rate(fsys, mcp2518fd.nbt_of(mcp2518fd.timing_known(fsys, rate))),
+                rate)
+        for rate in [2000000, 5000000]
+            let t = mcp2518fd.data_timing(fsys, rate, 800)
+            test.assert_eq(mcp2518fd.dbt_bits(t), mcp2518fd.timing_known(fsys, rate))
+            test.assert_eq(mcp2518fd.timing_rate(fsys, t), rate)
+            test.assert_eq(mcp2518fd.timing_rate(fsys, mcp2518fd.dbt_of(mcp2518fd.timing_known(fsys, rate))),
+                rate)
+    // Rows the table does not have.
+    test.assert_eq(mcp2518fd.timing_known(40000000, 250000), 0)
+    test.assert_eq(mcp2518fd.timing_known(20000000, 250000), 0)
+    test.assert_eq(mcp2518fd.timing_known(16000000, 500000), 0)
+
+@test
+fn test_the_table_values_by_hand() [io, hw]
+    // 40 MHz, 1 Mbit/s: 40 quanta, the sample point at 32, TSEG1 31, TSEG2 8.
+    test.assert_eq(mcp2518fd.timing_known(40000000, 1000000), 0x001E0707)
+    // 20 MHz, 1 Mbit/s: 20 quanta, TSEG1 15, TSEG2 4.
+    test.assert_eq(mcp2518fd.timing_known(20000000, 1000000), 0x000E0303)
+    // 40 MHz, 5 Mbit/s: 8 quanta, TSEG1 5, TSEG2 2.
+    test.assert_eq(mcp2518fd.timing_known(40000000, 5000000), 0x00040101)
+    // 20 MHz, 5 Mbit/s: 4 quanta, TSEG1 2, TSEG2 1.
+    test.assert_eq(mcp2518fd.timing_known(20000000, 5000000), 0x00010000)
+
+@test
+fn test_a_prescaler_above_1_is_used_when_the_bit_has_too_many_quanta() [io, hw]
+    // 100 kbit/s at 40 MHz is 400 quanta, past 385: the next prescaler
+    // makes 200.
+    let n = mcp2518fd.nominal_timing(40000000, 100000, 800)
+    test.assert_eq(n.brp, 2)
+    test.assert_eq(n.tseg1, 159)
+    test.assert_eq(n.tseg2, 40)
+    test.assert_eq(n.sjw, 40)
+    test.assert_eq(mcp2518fd.timing_rate(40000000, n), 100000)
+    // The data phase takes at most 49 quanta: 500 kbit/s needs a prescaler of 2.
+    let d = mcp2518fd.data_timing(40000000, 500000, 800)
+    test.assert_eq(d.brp, 2)
+    test.assert_eq(d.tseg1, 31)
+    test.assert_eq(d.tseg2, 8)
+
+@test
+fn test_a_rate_the_clock_cannot_make_has_no_timing() [io, hw]
+    test.assert_eq(mcp2518fd.nominal_timing(40000000, 300000, 800).brp, 0)
+    test.assert_eq(mcp2518fd.nominal_timing(0, 500000, 800).brp, 0)
+    test.assert_eq(mcp2518fd.nominal_timing(40000000, 0, 800).brp, 0)
+    test.assert_eq(mcp2518fd.nominal_timing(40000000, 500000, 0).brp, 0)
+    test.assert_eq(mcp2518fd.nominal_timing(40000000, 500000, 1000).brp, 0)
+    // 20 Mbit/s is two quanta a bit.
+    test.assert_eq(mcp2518fd.nominal_timing(40000000, 20000000, 800).brp, 0)
+    // A sample point that leaves TSEG2 past 16 in the data phase at every
+    // prescaler that fits.
+    test.assert_eq(mcp2518fd.data_timing(40000000, 1000000, 100).brp, 0)
+
+@test
+fn test_the_timing_registers_decode_to_their_fields() [io, hw]
+    let n = mcp2518fd.nbt_of(0x003E0F0F)
+    test.assert_eq(n.brp, 1)
+    test.assert_eq(n.tseg1, 63)
+    test.assert_eq(n.tseg2, 16)
+    test.assert_eq(n.sjw, 16)
+    let d = mcp2518fd.dbt_of(0x000E0303)
+    test.assert_eq(d.brp, 1)
+    test.assert_eq(d.tseg1, 15)
+    test.assert_eq(d.tseg2, 4)
+    test.assert_eq(d.sjw, 4)
+    test.assert_eq(mcp2518fd.nbt_of(0xFF7F7F7F).brp, 256)
+
+@test
+fn test_transmitter_delay_compensation_is_for_1_mbit_s_and_up() [io, hw]
+    let d = mcp2518fd.data_timing(40000000, 5000000, 800)
+    test.assert_eq(mcp2518fd.tdc_bits(5000000, d), 0x00020500)
+    test.assert_eq(mcp2518fd.tdc_bits(1000000, d), 0x00020500)
+    test.assert_eq(mcp2518fd.tdc_bits(500000, d), 0)
+    // The offset is 7 bits: past 63 it is held at 63.
+    test.assert_eq(mcp2518fd.tdc_bits(1000000, Mcp2518Timing { brp: 2, tseg1: 32, tseg2: 8, sjw: 8 }), 0x00023F00)
+
+@test
+fn test_the_spi_clock_limit_is_17_40_of_the_clock() [io, hw]
+    test.assert_eq(mcp2518fd.spi_safe_hz(40000000), 17000000)
+    test.assert_eq(mcp2518fd.spi_safe_hz(20000000), 8500000)
+    test.assert_eq(mcp2518fd.spi_safe_hz(4000000), 1700000)
+    test.assert_eq(mcp2518fd.spi_hz_for(40000000, 20000000), 17000000)
+    test.assert_eq(mcp2518fd.spi_hz_for(40000000, 10000000), 10000000)
+    test.assert_eq(mcp2518fd.spi_hz_for(20000000, 10000000), 8500000)
+    // A 4 MHz crystal with the PLL runs at 40 MHz; the sheet's 20 MHz ceiling holds.
+    test.assert_eq(mcp2518fd.spi_hz_for(100000000, 30000000), 20000000)
+
+// ── The identifier and header words ──────────────────────────────────
+
+@test
+fn test_the_identifier_word_follows_the_message_object_layout() [io, hw]
+    test.assert_eq(mcp2518fd.id_word(0x123, false), 0x123)
+    test.assert_eq(mcp2518fd.id_word(0x7FF, false), 0x7FF)
+    // The standard identifier is masked to 11 bits.
+    test.assert_eq(mcp2518fd.id_word(0xFFF, false), 0x7FF)
+    test.assert_eq(mcp2518fd.id_word(0x18DAF110, true), 0x17888636)
+    test.assert_eq(mcp2518fd.id_word(0x1FFFFFFF, true), 0x1FFFFFFF)
+    test.assert_eq(mcp2518fd.id_of_word(0x17888636, true), 0x18DAF110)
+    test.assert_eq(mcp2518fd.id_of_word(0x123, false), 0x123)
+    // R0 has two unimplemented top bits and SID11 in bit 29, which are ignored
+    // for a standard identifier.
+    test.assert_eq(mcp2518fd.id_of_word(0xE0000123, false), 0x123)
+
+@test
+fn test_the_header_word_follows_t1() [io, hw]
+    // DLC 3 and sequence 5: 3 | 5 << 9 = 0xA03.
+    test.assert_eq(mcp2518fd.header_word(3, false, false, false, false, false, 5), 0xA03)
+    // DLC 9, extended, FD, BRS, sequence 0x123: 9 | 0x10 | 0x40 | 0x80 | 0x123 << 9.
+    test.assert_eq(mcp2518fd.header_word(9, true, false, true, true, false, 0x123), 0x246D9)
+    test.assert_eq(mcp2518fd.header_word(4, true, true, false, false, false, 0), 0x34)
+    test.assert_eq(mcp2518fd.header_word(0, false, false, true, false, true, 0), 0x180)
+    // The sequence is 23 bits.
+    test.assert_eq(mcp2518fd.header_word(0, false, false, false, false, false, 0x800000), 0)
+    test.assert_eq(mcp2518fd.header_word(0, false, false, false, false, false, 0x7FFFFF), 0xFFFFFE00)
+    test.assert_eq(mcp2518fd.padded_words(0), 0)
+    test.assert_eq(mcp2518fd.padded_words(5), 2)
+    test.assert_eq(mcp2518fd.padded_words(64), 16)
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_read_is_the_command_nibble_the_address_and_the_count() [io, hw]
+    let c = chip()
+    let l = link(c)
+    word_set(c, 0x1F4, 0xAABBCCDD)
+    test.assert_eq(int_or(mcp2518fd.reg_read(l, 0x1F4)), 0xAABBCCDD)
+    log_is(c, [0x31, 0xF4, 4, -1])
+    test.assert_eq(int_or(mcp2518fd.byte_read(l, 0x1F5)), 0xCC)
+    log_is(c, [0x31, 0xF5, 1, -1])
+    var b: SpiBuf = Vec.new()
+    test.assert(mcp2518fd.regs_read(l, 0xE14, 4, var b))
+    log_is(c, [0x3E, 0x14, 4, -1])
+    test.assert_eq(b[0] as Int, 0x11)
+
+@test
+fn test_a_write_is_the_command_nibble_the_address_and_the_bytes_low_first() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert(mcp2518fd.reg_write(l, 0x1F4, 0xAABBCCDD))
+    log_is(c, [0x21, 0xF4, 0xDD, 0xCC, 0xBB, 0xAA, 0, -1])
+    test.assert_eq(word_get(c, 0x1F4), 0xAABBCCDD)
+    test.assert(mcp2518fd.byte_write(l, 0xE04, 0x03))
+    log_is(c, [0x2E, 0x04, 0x03, 0, -1])
+
+@test
+fn test_a_wiring_with_no_chip_select_cannot_transact() [io, hw]
+    let c = chip()
+    c.st.insert(41, 0)
+    let l = link(c)
+    test.assert(mcp2518fd.reg_read(l, 0x000) == None)
+    test.assert(mcp2518fd.byte_read(l, 0x000) == None)
+    test.assert(not mcp2518fd.reg_write(l, 0x000, 1))
+    test.assert(not mcp2518fd.byte_write(l, 0x000, 1))
+    test.assert(mcp2518fd.mode_read(l) == None)
+    test.assert(not mcp2518fd.reset(l))
+    test.assert_eq(mcp2518fd.open_code(l, 40000000, 500000, 0, mcp2518fd.config_default()), -1)
+
+@test
+fn test_a_part_that_is_not_there_reads_as_a_floating_bus() [io, hw]
+    let c = chip()
+    c.st.insert(1, 0)
+    let l = link(c)
+    test.assert_eq(int_or(mcp2518fd.reg_read(l, 0x000)), 0xFFFFFFFF)
+    test.assert(not mcp2518fd.reset(l))
+    test.assert_eq(mcp2518fd.open_code(l, 40000000, 500000, 0, mcp2518fd.config_default()), -1)
+    // A bus held low reads zeros.
+    c.st.insert(50, 0)
+    test.assert_eq(int_or(mcp2518fd.reg_read(l, 0x000)), 0)
+    test.assert_eq(mcp2518fd.open_code(l, 40000000, 500000, 0, mcp2518fd.config_default()), -1)
+
+// ── Modes and the reset ──────────────────────────────────────────────
+
+@test
+fn test_the_mode_is_opmod_in_byte_2_of_cicon() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(int_or(mcp2518fd.mode_read(l)), 4)
+    log_is(c, [0x30, 0x02, 1, -1])
+
+@test
+fn test_a_mode_request_writes_reqop_and_waits_for_opmod() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert(mcp2518fd.mode_set(l, mcp2518fd.MCP_MODE_NORMAL_20))
+    // REQOP in byte 3, then reads of byte 2 until OPMOD shows the mode: the
+    // double shows the old mode twice.
+    log_is(c, [0x20, 0x03, 0x06, 0, -1,
+        0x30, 0x02, 1, -1, 0x30, 0x02, 1, -1, 0x30, 0x02, 1, -1])
+    test.assert_eq(at(c.st, 21), 200)
+    // Configuration also sets ABAT.
+    test.assert(mcp2518fd.mode_set(l, mcp2518fd.MCP_MODE_CONFIG))
+    test.assert_eq(at(c.mem, 3), 0x04)
+    // A mode outside 0 to 7 is refused without a transaction.
+    log_clear(c)
+    test.assert(not mcp2518fd.mode_set(l, 8))
+    test.assert(not mcp2518fd.mode_set(l, -1))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_mode_that_does_not_come_is_not_reported() [io, hw]
+    let c = chip()
+    let l = link(c)
+    c.ro.insert(0x003, 1)
+    test.assert(not mcp2518fd.mode_set(l, mcp2518fd.MCP_MODE_LISTEN))
+    test.assert_eq(at(c.st, 21), 50000)
+    // A write that is not acknowledged at all.
+    c.st.insert(41, 0)
+    test.assert(not mcp2518fd.mode_set(l, mcp2518fd.MCP_MODE_NORMAL_20))
+
+@test
+fn test_the_reset_requests_configuration_resets_and_waits_for_the_reset_value() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // A configured part comes back to its reset values.
+    word_set(c, 0x004, 0x12345678)
+    c.st.insert(2, 6)
+    c.st.insert(3, 6)
+    test.assert(mcp2518fd.reset(l))
+    test.assert_eq(at(c.st, 5), 1)
+    test.assert_eq(word_get(c, 0x004), 0x003E0F0F)
+    // ABAT with Configuration, then RESET, then reads: three that answer 0
+    // while the oscillator restarts, and one that reads 0x04980760.
+    log_is(c, [0x20, 0x03, 0x0C, 0, -1,
+        0x00, 0x00, 0, -1,
+        0x30, 0x00, 4, -1, 0x30, 0x00, 4, -1, 0x30, 0x00, 4, -1, 0x30, 0x00, 4, -1])
+    // The 5 ms after RESET, then 500 us before each of the three reads that
+    // fail.
+    test.assert_eq(at(c.st, 21), 5000 + 3 * 500)
+
+@test
+fn test_the_reset_gives_up_when_the_reset_value_never_comes() [io, hw]
+    let c = chip()
+    let l = link(c)
+    c.st.insert(60, 1)
+    test.assert(not mcp2518fd.reset(l))
+    // 5 ms and 60 steps of 500 us.
+    test.assert_eq(at(c.st, 21), 5000 + 60 * 500)
+
+// ── The oscillator and the pins ──────────────────────────────────────
+
+@test
+fn test_the_oscillator_is_written_and_polled_until_it_is_ready() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert(mcp2518fd.osc_start(l, false))
+    test.assert_eq(word_get(c, 0xE00) & 0xFF, 0x00)
+    // OSCRDY (bit 10) shows after two reads that do not.
+    test.assert_eq(at(c.st, 21), 2000)
+    let d = chip()
+    let m = link(d)
+    test.assert(mcp2518fd.osc_start(m, true))
+    test.assert_eq(word_get(d, 0xE00) & 0xFF, 0x01)
+    // The PLL also settles for 200 us.
+    test.assert_eq(at(d.st, 21), 2200)
+
+@test
+fn test_an_oscillator_that_never_comes_up_is_reported() [io, hw]
+    let c = chip()
+    let l = link(c)
+    c.st.insert(51, 1)
+    test.assert(not mcp2518fd.osc_start(l, false))
+    test.assert_eq(at(c.st, 21), 100000)
+    // The write is not acknowledged, and the register stops answering.
+    let d = chip()
+    d.st.insert(41, 0)
+    test.assert(not mcp2518fd.osc_start(link(d), false))
+
+@test
+fn test_the_system_clock_follows_the_pll_and_the_divider() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(mcp2518fd.sysclk_read(l, 40000000), 40000000)
+    word_set(c, 0xE00, 0x01)
+    test.assert_eq(mcp2518fd.sysclk_read(l, 4000000), 40000000)
+    word_set(c, 0xE00, 0x10)
+    test.assert_eq(mcp2518fd.sysclk_read(l, 40000000), 20000000)
+    c.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.sysclk_read(l, 40000000), 0)
+
+@test
+fn test_gpio_pins_are_single_byte_writes_to_iocon() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // GPIO1 an output: the pin function set to GPIO (PM1, bit 1 of byte 3)
+    // and TRIS1 (bit 1 of byte 0) cleared.
+    word_set(c, 0xE04, 0x00000003)
+    test.assert(mcp2518fd.gpio_mode(l, 1, true))
+    log_is(c, [0x3E, 0x07, 1, -1, 0x3E, 0x04, 1, -1,
+        0x2E, 0x07, 0x02, 0, -1, 0x2E, 0x04, 0x01, 0, -1])
+    // GPIO0 an input again.
+    test.assert(mcp2518fd.gpio_mode(l, 0, false))
+    test.assert_eq(mem_get(c, 0xE04) & 3, 0x01)
+    test.assert_eq(mem_get(c, 0xE07) & 3, 0x03)
+    log_clear(c)
+    test.assert(mcp2518fd.gpio_set(l, 1, 1))
+    log_is(c, [0x3E, 0x05, 1, -1, 0x2E, 0x05, 0x02, 0, -1])
+    test.assert_eq(at(c.st, 30), 2)
+    test.assert_eq(mcp2518fd.gpio_get(l, 1), 1)
+    test.assert_eq(mcp2518fd.gpio_get(l, 0), 0)
+    test.assert(mcp2518fd.gpio_set(l, 1, 0))
+    test.assert_eq(mcp2518fd.gpio_get(l, 1), 0)
+    log_clear(c)
+    // A pin the part does not have costs no transaction.
+    test.assert(not mcp2518fd.gpio_mode(l, 2, true))
+    test.assert(not mcp2518fd.gpio_mode(l, -1, true))
+    test.assert(not mcp2518fd.gpio_set(l, 2, 1))
+    test.assert_eq(mcp2518fd.gpio_get(l, 2), -1)
+    test.assert_eq(at(c.st, 99), 0)
+    c.st.insert(41, 0)
+    test.assert(not mcp2518fd.gpio_mode(l, 0, true))
+    test.assert(not mcp2518fd.gpio_set(l, 0, 1))
+    test.assert_eq(mcp2518fd.gpio_get(l, 0), -1)
+
+@test
+fn test_gpio_stops_at_the_first_write_the_part_does_not_take() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // The pin-function byte is read-only here; the direction write is not
+    // made.
+    c.ro.insert(0xE07, 1)
+    c.st.insert(99, 0)
+    test.assert(mcp2518fd.gpio_mode(l, 0, true))
+    test.assert_eq(mem_get(c, 0xE04) & 1, 0)
+    // A read the part answers no more.
+    let d = chip()
+    d.st.insert(41, 0)
+    test.assert(not mcp2518fd.gpio_mode(link(d), 0, true))
+    // The part stops answering at the first write.
+    test.assert(not mcp2518fd.gpio_mode(LimitLink { c: chip(), left: 2 }, 0, true))
+
+// ── ECC and the RAM ──────────────────────────────────────────────────
+
+@test
+fn test_ecc_is_enabled_and_the_whole_ram_is_written_with_zeros() [io, hw]
+    let c = chip()
+    let l = link(c)
+    for a in 0x400..0xC00
+        c.mem.insert(a, 0xA5)
+    test.assert(mcp2518fd.ram_init(l))
+    test.assert_eq(at(c.st, 22), 1)
+    test.assert_eq(at(c.st, 25), 2048)
+    test.assert_eq(at(c.st, 20), 0)
+    for a in 0x400..0xC00
+        test.assert_eq(mem_get(c, a), 0)
+    // ECCCON byte 0, then 32 writes of 64 bytes at 0x400, 0x440 and on.
+    test.assert_eq(at(c.st, 99), 5 + 32 * 68)
+    test.assert_eq(at(c.log, 0), 0x2E)
+    test.assert_eq(at(c.log, 1), 0x0C)
+    test.assert_eq(at(c.log, 5), 0x24)
+    test.assert_eq(at(c.log, 6), 0x00)
+    test.assert_eq(at(c.log, 5 + 68 + 1), 0x40)
+
+@test
+fn test_the_ram_init_stops_at_a_write_the_part_refuses() [io, hw]
+    let c = chip()
+    c.st.insert(41, 0)
+    test.assert(not mcp2518fd.ram_init(link(c)))
+    // The ECC write is taken, the RAM write is not.
+    let d = chip()
+    let m = link(d)
+    d.st.insert(99, 0)
+    test.assert(mcp2518fd.byte_write(m, 0xE0C, 1))
+    d.ro.insert(0xE0C, 1)
+    test.assert(mcp2518fd.ram_init(m))
+
+@test
+fn test_the_ecc_status_and_the_device_id_are_reported() [io, hw]
+    let c = chip()
+    let l = link(c)
+    word_set(c, 0xE10, 0x01230002)
+    test.assert_eq(int_or(mcp2518fd.ecc_status(l)), 0x01230002)
+    test.assert_eq(int_or(mcp2518fd.devid_read(l)), 0x11)
+    c.st.insert(41, 0)
+    test.assert(mcp2518fd.ecc_status(l) == None)
+    test.assert(mcp2518fd.devid_read(l) == None)
+
+// ── Open ─────────────────────────────────────────────────────────────
+
+@test
+fn test_open_configures_the_whole_part_in_order() [io, hw]
+    let c = chip()
+    let l = link(c)
+    word_set(c, 0x01C, 0)
+    test.assert_eq(mcp2518fd.open_code(l, 40000000, 500000, 2000000, mcp2518fd.config_default()), 0)
+    test.assert_eq(at(c.st, 2), 0)
+    test.assert_eq(at(c.st, 5), 1)
+    // The bus was made ready twice: at 17/40 of the oscillator, then at the
+    // 10 MHz asked for.
+    test.assert_eq(at(c.st, 18), 2)
+    test.assert_eq(at(c.st, 19), 17000000)
+    test.assert_eq(at(c.st, 17), 10000000)
+    // CiCON: the reset base without OPMOD, and the mode in REQOP.
+    test.assert_eq(word_get(c, 0x000), 0x00180760)
+    test.assert_eq(mem_get(c, 0x003), 0)
+    test.assert_eq(word_get(c, 0x004), 0x003E0F0F)
+    test.assert_eq(word_get(c, 0x008), 0x000E0303)
+    test.assert_eq(word_get(c, 0x00C), 0x00020F00)
+    test.assert_eq(word_get(c, 0x040), 0x07000400)
+    test.assert_eq(word_get(c, 0x050), 0xE3410400)
+    test.assert_eq(word_get(c, 0x05C), 0xEF000409)
+    test.assert_eq(word_get(c, 0x068), 0xE3400480)
+    // Filter 0 passes every frame to FIFO 1: enabled, pointer 1, object and
+    // mask zero, and any type.
+    test.assert_eq(mem_get(c, 0x1D0), 0x81)
+    test.assert_eq(word_get(c, 0x1F0), 0)
+    test.assert_eq(word_get(c, 0x1F4), 0)
+    // The RAM is cleared with ECC on, and the receive interrupt enabled.
+    test.assert_eq(at(c.st, 22), 1)
+    test.assert_eq(at(c.st, 25), 2048)
+    test.assert_eq(word_get(c, 0x01C) >> 16, 0x0002)
+    // The pins are GPIO, both inputs; the clock output is not touched.
+    test.assert_eq(mem_get(c, 0xE07) & 3, 3)
+    test.assert_eq(mem_get(c, 0xE04), 0x03)
+    // The RAM accesses were whole words.
+    test.assert_eq(at(c.st, 20), 0)
+
+@test
+fn test_open_with_the_pll_and_the_interrupt_pins() [io, hw]
+    let c = chip()
+    let l = link(c)
+    let cfg = Mcp2518Config { mode: mcp2518fd.MCP_MODE_LISTEN, pll: true, spi_hz: 20000000, retries: 1,
+                              accept_all: false, irq_mask: 0x0012, int_pins: true, sample_nominal: 800,
+                              sample_data: 800 }
+    test.assert_eq(mcp2518fd.open_code(l, 4000000, 500000, 0, cfg), 0)
+    test.assert_eq(at(c.st, 2), 3)
+    test.assert_eq(at(c.st, 19), 1700000)
+    test.assert_eq(at(c.st, 17), 17000000)
+    test.assert_eq(word_get(c, 0xE00) & 1, 1)
+    test.assert_eq(word_get(c, 0x004), 0x003E0F0F)
+    // RTXAT set, three attempts.
+    test.assert_eq(word_get(c, 0x000) & 0x10000, 0x10000)
+    test.assert_eq(word_get(c, 0x050), 0xE3210400)
+    // No data phase was written: the reset value stays.
+    test.assert_eq(word_get(c, 0x008), 0x000E0303)
+    test.assert_eq(word_get(c, 0x00C), 0x00021000)
+    // The filters are off until a program writes one.
+    test.assert_eq(mem_get(c, 0x1D0), 0)
+    test.assert_eq(word_get(c, 0x01C) >> 16, 0x0012)
+    // INT0 and INT1 are outputs of the part: PM1 and PM0 clear.
+    test.assert_eq(mem_get(c, 0xE07) & 3, 0)
+
+@test
+fn test_one_attempt_and_unlimited_retransmission() [io, hw]
+    let c = chip()
+    let cfg = Mcp2518Config { mode: 0, pll: false, spi_hz: 1000000, retries: 2, accept_all: true,
+                              irq_mask: 0, int_pins: false, sample_nominal: 800, sample_data: 800 }
+    test.assert_eq(mcp2518fd.open_code(link(c), 20000000, 1000000, 0, cfg), 0)
+    test.assert_eq(word_get(c, 0x050), 0xE3010400)
+    test.assert_eq(word_get(c, 0x068), 0xE3000480)
+    test.assert_eq(word_get(c, 0x01C) >> 16, 0)
+    test.assert_eq(at(c.st, 17), 1000000)
+    test.assert_eq(word_get(c, 0x004), 0x000E0303)
+
+@test
+fn test_open_refuses_what_it_cannot_do_before_it_touches_the_bus() [io, hw]
+    let c = chip()
+    let l = link(c)
+    let d = mcp2518fd.config_default()
+    for m in [1, 4, 8, -1]
+        let bad = Mcp2518Config { mode: m, pll: false, spi_hz: 10000000, retries: 0, accept_all: true,
+                                  irq_mask: 0, int_pins: false, sample_nominal: 800, sample_data: 800 }
+        test.assert_eq(mcp2518fd.open_code(l, 40000000, 500000, 0, bad), -2)
+    for r in [-1, 3]
+        let bad = Mcp2518Config { mode: 0, pll: false, spi_hz: 10000000, retries: r, accept_all: true,
+                                  irq_mask: 0, int_pins: false, sample_nominal: 800, sample_data: 800 }
+        test.assert_eq(mcp2518fd.open_code(l, 40000000, 500000, 0, bad), -2)
+    test.assert_eq(mcp2518fd.open_code(l, 40000000, 300000, 0, d), -3)
+    test.assert_eq(mcp2518fd.open_code(l, 40000000, 500000, 300000, d), -3)
+    test.assert_eq(at(c.st, 99), 0)
+    test.assert_eq(at(c.st, 18), 0)
+
+@test
+fn test_open_stops_at_each_refusal_of_the_part() [io, hw]
+    // A bus with no chip select.
+    let a = chip()
+    a.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.open_code(link(a), 40000000, 500000, 0, mcp2518fd.config_default()), -1)
+    // The oscillator never comes up.
+    let b = chip()
+    b.st.insert(51, 1)
+    test.assert_eq(mcp2518fd.open_code(link(b), 40000000, 500000, 0, mcp2518fd.config_default()), -6)
+    // The bus cannot be made ready the second time, at the raised clock.
+    let h = chip()
+    h.st.insert(62, 1)
+    test.assert_eq(mcp2518fd.open_code(link(h), 40000000, 500000, 0, mcp2518fd.config_default()), -1)
+    test.assert_eq(at(h.st, 18), 2)
+    // The nominal timing is not held.
+    let e = chip()
+    freeze(e, 0x004, 4)
+    word_set(e, 0x004, 0x01010101)
+    test.assert_eq(mcp2518fd.open_code(link(e), 40000000, 1000000, 0, mcp2518fd.config_default()), -4)
+    // The data timing is not held.
+    let f = chip()
+    freeze(f, 0x008, 4)
+    word_set(f, 0x008, 0x01010101)
+    test.assert_eq(mcp2518fd.open_code(link(f), 40000000, 500000, 5000000, mcp2518fd.config_default()), -4)
+    // The mode never comes.
+    let g = chip()
+    g.ro.insert(0x003, 1)
+    test.assert_eq(mcp2518fd.open_code(link(g), 40000000, 500000, 0, mcp2518fd.config_default()), -5)
+
+@test
+fn test_open_simple_runs_normal_can_2_or_internal_loopback() [io, hw]
+    let c = chip()
+    test.assert(mcp2518fd.open_simple(link(c), 40000000, 500000, 0))
+    test.assert_eq(at(c.st, 2), 6)
+    let d = chip()
+    test.assert(mcp2518fd.open_simple(link(d), 40000000, 500000, 1))
+    test.assert_eq(at(d.st, 2), 2)
+    let e = chip()
+    test.assert(not mcp2518fd.open_simple(link(e), 40000000, 500000, 2))
+    test.assert(not mcp2518fd.open_simple(link(e), 40000000, 300000, 0))
+    test.assert_eq(at(e.st, 99), 0)
+
+@test
+fn test_every_open_write_after_the_reset_that_the_part_refuses_is_a_minus_one() [io, hw]
+    // The writes are taken until the Nth transaction; the double stops
+    // acknowledging then.  Each step of the sequence answers -1 or a more
+    // specific code, and none of them panics.
+    let whole = chip()
+    test.assert_eq(mcp2518fd.open_code(LimitLink { c: whole, left: 1000000 }, 40000000, 500000, 2000000,
+                                       mcp2518fd.config_default()),
+                                       0)
+    let total = at(whole.st, 98)
+    test.assert(total > 60)
+    for stop in 0..total
+        let c = chip()
+        let l = LimitLink { c: c, left: stop }
+        let code = mcp2518fd.open_code(l, 40000000, 500000, 2000000, mcp2518fd.config_default())
+        test.assert(code != 0)
+
+// A link that carries a fixed number of transactions and then refuses.
+struct LimitLink
+    c: Chip
+    left: Int
+
+impl FdLink for LimitLink
+    @tier(app)
+    fn link_xfer(self, tx: SpiBuf, n: Int, var dst: SpiBuf) -> Bool [hw]
+        let used = at(self.c.st, 98)
+        self.c.st.insert(98, used + 1)
+        if used >= self.left
+            dst.clear()
+            return false
+        link(self.c).link_xfer(tx, n, var dst)
+
+    fn link_wait(self, us: Int) [hw]
+        self.c.st.insert(21, at(self.c.st, 21) + us)
+
+    fn link_irq(self) -> Int [hw]
+        1
+
+    fn link_setup(self, hz: Int) -> Bool [hw]
+        true
+
+// ── Transmit ─────────────────────────────────────────────────────────
+
+fn frame8() -> CanBusFrame
+    embedded_hal.can_data(0x123, 3, 0xCCBBAA)
+
+@test
+fn test_a_classic_frame_goes_into_the_queue_as_t0_t1_and_data_words() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 5), 0)
+    // CiTXQSTA and CiTXQUA in one read; the object at 0x400 + 64 = 0x440:
+    // T0 = 0x123, T1 = DLC 3 | SEQ 5 << 9 = 0xA03, then one data word;
+    // then UINC and TXREQ together in CiTXQCON byte 1.
+    log_is(c, [0x30, 0x54, 8, -1,
+        0x24, 0x40, 0x23, 0x01, 0x00, 0x00, 0x03, 0x0A, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0x00, 0, -1,
+        0x20, 0x51, 0x03, 0, -1])
+    test.assert_eq(at(c.st, 7), 1)
+    test.assert_eq(at(c.st, 9), 1)
+    test.assert_eq(txq_word(c, 0, 0), 0x123)
+    test.assert_eq(txq_word(c, 0, 4), 0xA03)
+    test.assert_eq(txq_word(c, 0, 8), 0xCCBBAA)
+    test.assert_eq(at(c.st, 20), 0)
+
+@test
+fn test_an_extended_classic_frame_and_a_remote_frame() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // T0 for an extended identifier is the identifier itself when it is all
+    // ones; T1 is DLC 8 | IDE 0x10 = 0x18; two data words, byte 0 first.
+    test.assert_eq(mcp2518fd.send_classic(l, 0, embedded_hal.can_data_ext(0x1FFFFFFF, 8, 0x0807060504030201), 0),
+        0)
+    log_is(c, [0x30, 0x54, 8, -1,
+        0x24, 0x40, 0xFF, 0xFF, 0xFF, 0x1F, 0x18, 0x00, 0x00, 0x00,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0, -1,
+        0x20, 0x51, 0x03, 0, -1])
+    // A remote frame asking for 4 bytes carries no data words: T1 is
+    // DLC 4 | RTR 0x20 = 0x24, and the object is the 8-byte header.
+    test.assert_eq(mcp2518fd.send_classic(l, 0, embedded_hal.can_remote(0x321, false, 4), 0), 0)
+    log_is(c, [0x30, 0x54, 8, -1,
+        0x24, 0x88, 0x21, 0x03, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0, -1,
+        0x20, 0x51, 0x03, 0, -1])
+    // A frame of no bytes carries no data words either.
+    test.assert_eq(mcp2518fd.send_classic(l, 0, embedded_hal.can_data(0x7FF, 0, 0), 0), 0)
+    test.assert_eq(at(c.st, 7), 3)
+
+@test
+fn test_the_transmit_fifo_has_its_own_registers() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // FIFO 2: status at 0x06C, the object at 0x400 + 1504 = 0x9E0, control at
+    // 0x068 and its byte 1 at 0x069.
+    test.assert_eq(mcp2518fd.send_classic(l, 1, frame8(), 5), 0)
+    log_is(c, [0x30, 0x6C, 8, -1,
+        0x29, 0xE0, 0x23, 0x01, 0x00, 0x00, 0x03, 0x0A, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0x00, 0, -1,
+        0x20, 0x69, 0x03, 0, -1])
+    test.assert_eq(at(c.st, 12), 1)
+    test.assert_eq(at(c.st, 7), 0)
+    test.assert_eq(txf_word(c, 0, 0), 0x123)
+
+@test
+fn test_a_full_queue_is_reported_and_costs_no_object_write() [io, hw]
+    let c = chip()
+    let l = link(c)
+    for k in 0..4
+        test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), k), 0)
+    log_clear(c)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 9), -2)
+    log_is(c, [0x30, 0x54, 8, -1])
+    // The FIFO fills the same way.
+    for k in 0..4
+        test.assert_eq(mcp2518fd.send_classic(l, 1, frame8(), k), 0)
+    test.assert_eq(mcp2518fd.send_classic(l, 1, frame8(), 9), -2)
+    // The bus empties the queue and room returns.
+    bus_send(c, false)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 9), 0)
+
+@test
+fn test_a_frame_the_part_cannot_carry_is_refused_before_the_bus() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(mcp2518fd.send_classic(l, 2, frame8(), 0), -3)
+    test.assert_eq(mcp2518fd.send_classic(l, -1, frame8(), 0), -3)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, embedded_hal.can_data(0x800, 1, 0), 0), -3)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, embedded_hal.can_data(0x123, 9, 0), 0), -3)
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_part_that_does_not_answer_fails_a_send_at_each_step() [io, hw]
+    let c = chip()
+    c.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.send_classic(link(c), 0, frame8(), 0), -1)
+    // The slot read answers; the object write does not; the commit does not.
+    for left in [1, 2]
+        let d = chip()
+        let l = LimitLink { c: d, left: left }
+        test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 0), -1)
+
+fn fd_data(n: Int) -> Vec[u8; 64]
+    var d: Vec[u8; 64] = Vec.new()
+    for i in 0..n
+        let _ = d.push(i as u8)
+    d
+
+@test
+fn test_an_fd_frame_is_written_as_whole_words_and_carries_brs() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var data: Vec[u8; 64] = Vec.new()
+    for i in 0..12
+        let _ = data.push((i + 1) as u8)
+    // Extended 0x18DAF110, FD with BRS, 12 bytes: DLC 9, T0 0x17888636, T1 =
+    // 9 | IDE 0x10 | BRS 0x40 | FDF 0x80 | SEQ 0x123 << 9 = 0x246D9.
+    let f = canframe.fd_frame_ext(0x18DAF110, 12, true)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, f, var data, 0x123), 0)
+    log_is(c, [0x30, 0x54, 8, -1,
+        0x24, 0x40, 0x36, 0x86, 0x88, 0x17, 0xD9, 0x46, 0x02, 0x00,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, -1,
+        0x20, 0x51, 0x03, 0, -1])
+    // 6 bytes are DLC 6, and the object holds whole words: the last two bytes
+    // go out as zeros after the data.  No BRS: T1 = 6 | FDF 0x80 | 1 << 9 = 0x286.
+    var six: Vec[u8; 64] = Vec.new()
+    for i in 0..6
+        let _ = six.push((i + 1) as u8)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame(0x7FF, 6, false), var six, 1), 0)
+    log_is(c, [0x30, 0x54, 8, -1,
+        0x24, 0x88, 0xFF, 0x07, 0x00, 0x00, 0x86, 0x02, 0x00, 0x00,
+        1, 2, 3, 4, 5, 6, 0, 0, 0, -1,
+        0x20, 0x51, 0x03, 0, -1])
+    // 10 bytes are not a length of the format.
+    var ten: Vec[u8; 64] = Vec.new()
+    for i in 0..10
+        let _ = ten.push((i + 1) as u8)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame(0x7FF, 10, false), var ten, 1), -3)
+
+@test
+fn test_a_64_byte_fd_frame_fills_an_object() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var data = fd_data(64)
+    // DLC 15, BRS and FDF: 0xF | 0x40 | 0x80 | 7 << 9 = 0xECF.
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame(0x100, 64, true), var data, 7), 0)
+    test.assert_eq(txq_word(c, 0, 0), 0x100)
+    test.assert_eq(txq_word(c, 0, 4), 0xECF)
+    for k in 0..16
+        test.assert_eq(txq_word(c, 0, 8 + 4 * k),
+            (4 * k) | ((4 * k + 1) << 8) | ((4 * k + 2) << 16) | ((4 * k + 3) << 24))
+    test.assert_eq(at(c.st, 20), 0)
+    // The same frame through the transmit FIFO.
+    test.assert_eq(mcp2518fd.send_fd(l, 1, canframe.fd_frame(0x100, 64, true), var data, 7), 0)
+    test.assert_eq(txf_word(c, 0, 4), 0xECF)
+
+@test
+fn test_a_classic_frame_in_the_fd_path_and_a_frame_with_esi() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var data = fd_data(8)
+    // FD flag clear: a classic frame of 8 bytes, DLC 8.
+    let classic = CanFdFrame { id: 0x55, flags: 0, len: 8 }
+    test.assert_eq(mcp2518fd.send_fd(l, 0, classic, var data, 0), 0)
+    test.assert_eq(txq_word(c, 0, 4), 8)
+    // ESI set on an FD frame: bit 8.
+    let esi = CanFdFrame { id: 0x55, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_ESI, len: 8 }
+    test.assert_eq(mcp2518fd.send_fd(l, 0, esi, var data, 0), 0)
+    test.assert_eq(txq_word(c, 1, 4), 0x188)
+    // A classic remote frame in the FD path has no data words.
+    let remote = CanFdFrame { id: 0x55, flags: canframe.CAN_FLAG_RTR, len: 2 }
+    log_clear(c)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, remote, var data, 0), 0)
+    test.assert_eq(at(c.st, 99), 4 + 2 + 8 + 2 + 5)
+
+@test
+fn test_an_fd_frame_that_cannot_be_encoded_is_refused_before_the_bus() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var data = fd_data(64)
+    test.assert_eq(mcp2518fd.send_fd(l, 2, canframe.fd_frame(1, 8, false), var data, 0), -3)
+    // Length 65, and length 9 in a classic frame.
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame(1, 65, false), var data, 0), -3)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, CanFdFrame { id: 1, flags: 0, len: 9 }, var data, 0), -3)
+    // An identifier too wide for its format.
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame(0x800, 8, false), var data, 0), -3)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame_ext(0x20000000, 8, false), var data, 0), -3)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame(-1, 8, false), var data, 0), -3)
+    // A remote frame in FD format, and BRS without FD.
+    test.assert_eq(mcp2518fd.send_fd(l,
+        0,
+        CanFdFrame { id: 1, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FLAG_RTR, len: 2 },
+        var data,
+        0),
+    -3)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, CanFdFrame { id: 1, flags: canframe.CAN_FD_FLAG_BRS, len: 2 }, var data, 0),
+        -3)
+    // A payload shorter than the length.
+    var short = fd_data(4)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame(1, 8, false), var short, 0), -3)
+    test.assert_eq(at(c.st, 99), 0)
+    // The part does not answer.
+    c.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.send_fd(link(c), 0, canframe.fd_frame(1, 8, false), var data, 0), -1)
+    let d = chip()
+    test.assert_eq(mcp2518fd.send_fd(LimitLink { c: d, left: 2 }, 0, canframe.fd_frame(1, 8, false), var data, 0),
+        -1)
+
+@test
+fn test_a_transmitted_frame_comes_back_as_a_transmit_event() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 5), 0)
+    var data = fd_data(12)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, canframe.fd_frame_ext(0x18DAF110, 12, true), var data, 0x123), 0)
+    log_clear(c)
+    // Nothing has been sent yet.
+    let none = mcp2518fd.tef_read(l)
+    test.assert_eq(none.seq, -1)
+    log_is(c, [0x30, 0x44, 8, -1])
+    bus_send(c, false)
+    let a = mcp2518fd.tef_read(l)
+    test.assert_eq(a.id, 0x123)
+    test.assert_eq(a.flags, 0)
+    test.assert_eq(a.len, 3)
+    test.assert_eq(a.seq, 5)
+    // Status and user address, the 8-byte object at 0x400, then UINC.
+    log_is(c, [0x30, 0x44, 8, -1, 0x34, 0x00, 8, -1, 0x20, 0x41, 0x01, 0, -1])
+    let b = mcp2518fd.tef_read(l)
+    test.assert_eq(b.id, 0x18DAF110)
+    test.assert_eq(b.flags, canframe.CAN_FLAG_EXTENDED | canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_BRS)
+    test.assert_eq(b.len, 12)
+    test.assert_eq(b.seq, 0x123)
+    test.assert_eq(mcp2518fd.tef_read(l).seq, -1)
+
+@test
+fn test_a_transmit_event_reports_remote_and_esi_frames_and_failures() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, embedded_hal.can_remote(0x321, false, 4), 2), 0)
+    bus_send(c, false)
+    let r = mcp2518fd.tef_read(l)
+    test.assert_eq(r.id, 0x321)
+    test.assert_eq(r.flags, canframe.CAN_FLAG_RTR)
+    test.assert_eq(r.seq, 2)
+    var data = fd_data(8)
+    let esi = CanFdFrame { id: 0x55, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_ESI, len: 8 }
+    test.assert_eq(mcp2518fd.send_fd(l, 0, esi, var data, 3), 0)
+    bus_send(c, false)
+    test.assert_eq(mcp2518fd.tef_read(l).flags, canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_ESI)
+    // The part does not answer at the status read, the object read or the
+    // increment.
+    let d = chip()
+    d.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.tef_read(link(d)).seq, -2)
+    for left in [1, 2]
+        let e = chip()
+        e.st.insert(15, 1)
+        test.assert_eq(mcp2518fd.tef_read(LimitLink { c: e, left: left }).seq, -2)
+
+// ── Receive ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_classic_frame_is_read_from_the_fifo_and_the_tail_incremented() [io, hw]
+    let c = chip()
+    let l = link(c)
+    rx_put(c, 0x123, 3, [0xAA, 0xBB, 0xCC])
+    match mcp2518fd.receive_frame(l)
+        Some(f) =>
+            test.assert_eq(f.id, 0x123)
+            test.assert(not f.extended)
+            test.assert(not f.remote)
+            test.assert_eq(f.len, 3)
+            test.assert_eq(f.data, 0xCCBBAA)
+        None    => test.assert(false)
+    // CiFIFOSTA1 and CiFIFOUA1, the object at 0x400 + 352 = 0x560 (16 bytes:
+    // R0, R1 and 8 data bytes), then UINC in CiFIFOCON1 byte 1.
+    log_is(c, [0x30, 0x60, 8, -1, 0x35, 0x60, 16, -1, 0x20, 0x5D, 0x01, 0, -1])
+    test.assert_eq(at(c.st, 10), 0)
+    test.assert_eq(at(c.st, 11), 1)
+    // The FIFO is empty now: one read and nothing more.
+    test.assert(mcp2518fd.receive_frame(l) == None)
+    log_is(c, [0x30, 0x60, 8, -1])
+    test.assert_eq(at(c.st, 20), 0)
+
+@test
+fn test_an_extended_and_a_remote_frame_are_decoded_from_r0_and_r1() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // R1 = IDE 0x10 | DLC 8.
+    rx_put(c, 0x17888636, 0x18, [1, 2, 3, 4, 5, 6, 7, 8])
+    match mcp2518fd.receive_frame(l)
+        Some(f) =>
+            test.assert_eq(f.id, 0x18DAF110)
+            test.assert(f.extended)
+            test.assert_eq(f.len, 8)
+            test.assert_eq(f.data, 0x0807060504030201)
+        None    => test.assert(false)
+    // A remote frame asking for 4 bytes: RTR 0x20 | DLC 4, with no payload,
+    // whatever the data words hold.
+    rx_put(c, 0x321, 0x24, [9, 9, 9, 9])
+    match mcp2518fd.receive_frame(l)
+        Some(f) =>
+            test.assert_eq(f.id, 0x321)
+            test.assert(f.remote)
+            test.assert_eq(f.len, 4)
+            test.assert_eq(f.data, 0)
+        None    => test.assert(false)
+    // A classic DLC above 8 is 8 bytes (ISO 11898-1).
+    rx_put(c, 0x100, 0x0F, [1, 2, 3, 4, 5, 6, 7, 8])
+    match mcp2518fd.receive_frame(l)
+        Some(f) =>
+            test.assert_eq(f.len, 8)
+            test.assert_eq(f.data, 0x0807060504030201)
+        None    => test.assert(false)
+
+@test
+fn test_an_fd_frame_is_read_in_two_pieces_when_it_is_longer_than_8_bytes() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var all: [Int] = []
+    for i in 0..64
+        list.push(all, i)
+    // FDF 0x80 | BRS 0x40 | DLC 15, and ESI 0x100.
+    rx_put(c, 0x17888636, 0x1CF | 0x10, all)
+    var data: Vec[u8; 64] = Vec.new()
+    let h = mcp2518fd.fd_receive(l, var data)
+    test.assert(canframe.fd_is_frame(h))
+    test.assert_eq(h.id, 0x18DAF110)
+    test.assert_eq(h.len, 64)
+    test.assert_eq(h.flags,
+        canframe.CAN_FLAG_EXTENDED | canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_BRS | canframe.CAN_FD_FLAG_ESI)
+    test.assert_eq(data.len(), 64)
+    for i in 0..64
+        test.assert_eq(data[i] as Int, i)
+    // The first 16 bytes, then the other 56 from 0x570, then UINC.
+    log_is(c, [0x30, 0x60, 8, -1, 0x35, 0x60, 16, -1, 0x35, 0x70, 56, -1, 0x20, 0x5D, 0x01, 0, -1])
+    // 12 bytes (DLC 9): the second read is 4 bytes.
+    rx_put(c, 0x100, 0xC9, all)
+    let g = mcp2518fd.fd_receive(l, var data)
+    test.assert_eq(g.len, 12)
+    test.assert_eq(data.len(), 12)
+    test.assert_eq(data[11] as Int, 11)
+    log_is(c, [0x30, 0x60, 8, -1, 0x35, 0xA8, 16, -1, 0x35, 0xB8, 4, -1, 0x20, 0x5D, 0x01, 0, -1])
+    // A classic frame through the FD path leaves the FD flag clear.
+    rx_put(c, 0x100, 0x03, [7, 8, 9])
+    let k = mcp2518fd.fd_receive(l, var data)
+    test.assert_eq(k.flags, 0)
+    test.assert_eq(k.len, 3)
+    test.assert_eq(data[0] as Int, 7)
+    test.assert_eq(at(c.st, 20), 0)
+
+@test
+fn test_an_empty_fifo_and_a_part_that_does_not_answer_have_their_own_values() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var data: Vec[u8; 64] = Vec.new()
+    test.assert(canframe.fd_is_none(mcp2518fd.fd_receive(l, var data)))
+    c.st.insert(41, 0)
+    let h = mcp2518fd.fd_receive(link(c), var data)
+    test.assert(canframe.fd_is_fault(h))
+    test.assert_eq(h.id, canframe.CAN_FAULT_DISCONNECTED)
+    test.assert(mcp2518fd.receive_frame(link(c)) == None)
+    // The part stops answering at the header read, the second piece, and the
+    // increment.
+    var all: [Int] = []
+    for i in 0..64
+        list.push(all, i)
+    for left in [1, 2, 3]
+        let d = chip()
+        rx_put(d, 0x100, 0xCF, all)
+        test.assert(canframe.fd_is_fault(mcp2518fd.fd_receive(LimitLink { c: d, left: left }, var data)))
+    let e = chip()
+    rx_put(e, 0x100, 0x03, [1, 2, 3])
+    test.assert(canframe.fd_is_fault(mcp2518fd.fd_receive(LimitLink { c: e, left: 2 }, var data)))
+
+@test
+fn test_a_classic_receive_drops_an_fd_frame_and_returns_the_next_frame() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var all: [Int] = []
+    for i in 0..64
+        list.push(all, i)
+    rx_put(c, 0x111, 0xC9, all)
+    rx_put(c, 0x222, 0x02, [5, 6])
+    match mcp2518fd.receive_frame(l)
+        Some(f) =>
+            test.assert_eq(f.id, 0x222)
+            test.assert_eq(f.data, 0x0605)
+        None    => test.assert(false)
+    test.assert_eq(at(c.st, 10), 0)
+    // Only FD frames: all are dropped and the FIFO is empty.
+    rx_put(c, 0x111, 0xC9, all)
+    test.assert(mcp2518fd.receive_frame(l) == None)
+    test.assert_eq(at(c.st, 10), 0)
+
+@test
+fn test_the_receive_by_pin_reads_nothing_while_the_pin_is_high() [io, hw]
+    let c = chip()
+    let l = link(c)
+    rx_put(c, 0x123, 1, [0x55])
+    test.assert(mcp2518fd.receive_irq(l) == None)
+    test.assert_eq(at(c.st, 99), 0)
+    c.st.insert(40, 0)
+    match mcp2518fd.receive_irq(l)
+        Some(f) => test.assert_eq(f.data, 0x55)
+        None    => test.assert(false)
+    // A wiring with no INT pin reads the FIFO.
+    c.st.insert(40, -1)
+    rx_put(c, 0x124, 1, [0x56])
+    test.assert(mcp2518fd.receive_irq(l) != None)
+    test.assert_eq(mcp2518fd.irq_level(l), -1)
+
+@test
+fn test_a_classic_receive_gives_up_after_a_fifo_of_fd_frames() [io, hw]
+    let c = chip()
+    let l = link(c)
+    var all: [Int] = []
+    for i in 0..64
+        list.push(all, i)
+    for _k in 0..16
+        rx_put(c, 0x111, 0xC9, all)
+    test.assert(mcp2518fd.receive_frame(l) == None)
+    test.assert_eq(at(c.st, 10), 0)
+
+@test
+fn test_loopback_returns_what_was_sent() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 1), 0)
+    bus_send(c, true)
+    match mcp2518fd.receive_frame(l)
+        Some(f) =>
+            test.assert_eq(f.id, 0x123)
+            test.assert_eq(f.len, 3)
+            test.assert_eq(f.data, 0xCCBBAA)
+        None    => test.assert(false)
+    var data = fd_data(20)
+    let fd = canframe.fd_frame_ext(0x18DAF110, 20, true)
+    test.assert_eq(mcp2518fd.send_fd(l, 0, fd, var data, 2), 0)
+    bus_send(c, true)
+    var back: Vec[u8; 64] = Vec.new()
+    let h = mcp2518fd.fd_receive(l, var back)
+    test.assert_eq(h.id, 0x18DAF110)
+    test.assert_eq(h.len, 20)
+    test.assert_eq(back.len(), 20)
+    for i in 0..20
+        test.assert_eq(back[i] as Int, i)
+    test.assert(canframe.fd_has_brs(h))
+
+// ── Filters ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_filter_is_disabled_written_read_back_and_enabled() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // Filter 3: CiFLTCON0 byte 3, CiFLTOBJ3 at 0x208 and CiMASK3 at 0x20C.
+    // A standard filter passes only standard frames: EXIDE clear, MIDE set,
+    // so the mask is 0x400007FF.
+    test.assert(mcp2518fd.filter_set(l, 3, 0x123, 0x7FF, false, false, 1))
+    log_is(c, [0x21, 0xD3, 0x00, 0, -1,
+        0x22, 0x08, 0x23, 0x01, 0x00, 0x00, 0, -1,
+        0x22, 0x0C, 0xFF, 0x07, 0x00, 0x40, 0, -1,
+        0x32, 0x08, 4, -1, 0x32, 0x0C, 4, -1,
+        0x21, 0xD3, 0x81, 0, -1])
+    test.assert_eq(word_get(c, 0x208), 0x123)
+    test.assert_eq(word_get(c, 0x20C), 0x400007FF)
+    // An extended filter for 0x18DAF110 under a mask of 0x1FFFFF00 on the
+    // 6th filter, into FIFO 4: EXIDE and MIDE set.
+    test.assert(mcp2518fd.filter_set(l, 5, 0x18DAF110, 0x1FFFFF00, true, false, 4))
+    test.assert_eq(word_get(c, 0x1F0 + 40), 0x57888636)
+    test.assert_eq(word_get(c, 0x1F4 + 40), 0x5FF807FF)
+    test.assert_eq(mem_get(c, 0x1D5), 0x84)
+    // All types: MIDE clear.
+    test.assert(mcp2518fd.filter_set(l, 31, 0x100, 0x700, false, true, 31))
+    test.assert_eq(word_get(c, 0x1F4 + 248), 0x700)
+    test.assert_eq(mem_get(c, 0x1EF), 0x9F)
+
+@test
+fn test_the_filter_and_mask_words_follow_registers_3_33_and_3_34() [io, hw]
+    // A standard filter: the identifier in SID, EXIDE clear.
+    test.assert_eq(mcp2518fd.filter_word(0x123, false), 0x123)
+    // An extended filter: the T0 layout and EXIDE (bit 30).
+    test.assert_eq(mcp2518fd.filter_word(0x18DAF110, true), 0x57888636)
+    // The mask: the T0 layout of the mask, and MIDE (bit 30) when the type of
+    // the frame has to match.  0x1FFFFF00 has the SID 0x7FF and the EID 0x3FF00.
+    test.assert_eq(mcp2518fd.mask_word(0x7F0, false, true), 0x400007F0)
+    test.assert_eq(mcp2518fd.mask_word(0x7F0, false, false), 0x7F0)
+    test.assert_eq(mcp2518fd.mask_word(0x1FFFFF00, true, true), 0x5FF807FF)
+    test.assert_eq(mcp2518fd.mask_word(0x1FFFFF00, true, false), 0x1FF807FF)
+    // No timing at all is the one with a prescaler of 0.
+    let none = mcp2518fd.timing_none()
+    test.assert_eq(none.brp, 0)
+    test.assert_eq(none.tseg1, 0)
+    test.assert_eq(none.tseg2, 0)
+    test.assert_eq(none.sjw, 0)
+
+@test
+fn test_a_filter_outside_the_part_is_refused_before_the_bus() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert(not mcp2518fd.filter_set(l, 32, 0, 0, false, true, 1))
+    test.assert(not mcp2518fd.filter_set(l, -1, 0, 0, false, true, 1))
+    test.assert(not mcp2518fd.filter_set(l, 0, 0, 0, false, true, 0))
+    test.assert(not mcp2518fd.filter_set(l, 0, 0, 0, false, true, 32))
+    test.assert(not mcp2518fd.filter_clear(l, 32))
+    test.assert(not mcp2518fd.filter_clear(l, -1))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_filter_the_part_does_not_hold_is_reported() [io, hw]
+    let c = chip()
+    freeze(c, 0x1F0, 4)
+    test.assert(not mcp2518fd.filter_set(link(c), 0, 0x123, 0x7FF, false, false, 1))
+    let d = chip()
+    freeze(d, 0x1F4, 4)
+    test.assert(not mcp2518fd.filter_set(link(d), 0, 0x123, 0x7FF, false, false, 1))
+    // The part stops answering after each step.
+    for left in [0, 1, 2, 3, 4, 5]
+        let e = chip()
+        test.assert(not mcp2518fd.filter_set(LimitLink { c: e, left: left }, 0, 0x123, 0x7FF, false, false, 1))
+
+@test
+fn test_a_filter_is_cleared_with_one_byte() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert(mcp2518fd.filter_set(l, 7, 1, 1, false, true, 1))
+    log_clear(c)
+    test.assert(mcp2518fd.filter_clear(l, 7))
+    log_is(c, [0x21, 0xD7, 0x00, 0, -1])
+    test.assert_eq(mem_get(c, 0x1D7), 0)
+
+// ── Interrupts ───────────────────────────────────────────────────────
+
+@test
+fn test_the_interrupt_flags_and_enables() [io, hw]
+    let c = chip()
+    let l = link(c)
+    word_set(c, 0x01C, 0x0002_8008)
+    test.assert_eq(int_or(mcp2518fd.int_read(l)), 0x00028008)
+    test.assert_eq(mcp2518fd.int_flags(l), 0x8008)
+    // The enables are the flags shifted up by 16, written two bytes at once.
+    log_clear(c)
+    test.assert(mcp2518fd.int_enable(l, 0x0012))
+    log_is(c, [0x20, 0x1E, 0x12, 0x00, 0, -1])
+    test.assert(mcp2518fd.int_enable(l, 0x8001))
+    log_is(c, [0x20, 0x1E, 0x01, 0x80, 0, -1])
+    c.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.int_flags(l), -1)
+    test.assert(mcp2518fd.int_read(l) == None)
+    test.assert(not mcp2518fd.int_enable(l, 1))
+
+@test
+fn test_the_flags_follow_the_fifos() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(mcp2518fd.int_flags(l), 0)
+    rx_put(c, 0x123, 0, [])
+    test.assert_eq(mcp2518fd.int_flags(l), mcp2518fd.INT_RXIF)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 0), 0)
+    bus_send(c, false)
+    test.assert_eq(mcp2518fd.int_flags(l), mcp2518fd.INT_RXIF | mcp2518fd.INT_TEFIF)
+
+@test
+fn test_the_flags_software_clears_are_written_with_zeros() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // Mode change (bit 3) in byte 0 and wake (bit 14) in byte 1: the bits
+    // cleared are written 0, the others 1, which has no effect.
+    test.assert(mcp2518fd.int_clear(l, mcp2518fd.INT_MODIF | mcp2518fd.INT_WAKIF))
+    log_is(c, [0x20, 0x1D, 0xBF, 0, -1, 0x20, 0x1C, 0xF7, 0, -1])
+    test.assert(mcp2518fd.int_clear(l, mcp2518fd.INT_IVMIF))
+    log_is(c, [0x20, 0x1D, 0x7F, 0, -1])
+    test.assert(mcp2518fd.int_clear(l, mcp2518fd.INT_TBCIF))
+    log_is(c, [0x20, 0x1C, 0xFB, 0, -1])
+    test.assert(mcp2518fd.int_clear(l, 0))
+    test.assert_eq(at(c.st, 99), 0)
+    // A write the part refuses, in the first and in the second byte.
+    c.st.insert(41, 0)
+    test.assert(not mcp2518fd.int_clear(l, 0x4008))
+    test.assert(not mcp2518fd.int_clear(l, 0x0008))
+    let d = chip()
+    test.assert(not mcp2518fd.int_clear(LimitLink { c: d, left: 1 }, 0x4008))
+
+// ── Errors, the bit rate and the state of the queues ─────────────────
+
+@test
+fn test_the_error_counters_and_the_fault_confinement_state() [io, hw]
+    let c = chip()
+    let l = link(c)
+    word_set(c, 0x034, 5 | (130 << 8))
+    match mcp2518fd.errors_read(l)
+        Some(e) =>
+            test.assert_eq(e.tx, 130)
+            test.assert_eq(e.rx, 5)
+            test.assert_eq(e.state, embedded_hal.CAN_ERROR_ACTIVE)
+        None    => test.assert(false)
+    // Error-passive by the transmitter (bit 20) and by the receiver (bit 19).
+    word_set(c, 0x034, (1 << 20) | (130 << 8) | 5)
+    test.assert_eq(state_or(mcp2518fd.errors_read(l)), embedded_hal.CAN_ERROR_PASSIVE)
+    word_set(c, 0x034, 1 << 19)
+    test.assert_eq(state_or(mcp2518fd.errors_read(l)), embedded_hal.CAN_ERROR_PASSIVE)
+    // Bus-off (bit 21) wins.
+    word_set(c, 0x034, (1 << 21) | (1 << 20))
+    test.assert_eq(state_or(mcp2518fd.errors_read(l)), embedded_hal.CAN_BUS_OFF)
+    c.st.insert(41, 0)
+    test.assert(mcp2518fd.errors_read(l) == None)
+
+fn state_or(o: ?CanBusErrors) -> Int
+    match o
+        Some(e) => e.state
+        None    => -999999
+
+@test
+fn test_the_errors_of_a_part_in_configuration_mode_are_idle() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // CiTREC reads bus-off in Configuration mode (Register 3-20).
+    word_set(c, 0x034, (1 << 21) | (3 << 8) | 4)
+    let idle = mcp2518fd.errors_or_idle(l)
+    test.assert_eq(idle.tx, 0)
+    test.assert_eq(idle.rx, 0)
+    test.assert_eq(idle.state, embedded_hal.CAN_ERROR_ACTIVE)
+    test.assert(mcp2518fd.open_simple(l, 40000000, 500000, 0))
+    word_set(c, 0x034, (1 << 20) | (3 << 8) | 4)
+    let live = mcp2518fd.errors_or_idle(l)
+    test.assert_eq(live.tx, 3)
+    test.assert_eq(live.rx, 4)
+    test.assert_eq(live.state, embedded_hal.CAN_ERROR_PASSIVE)
+    // The part stops answering at the mode read, and after it.
+    let d = chip()
+    d.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.errors_or_idle(link(d)).state, embedded_hal.CAN_ERROR_ACTIVE)
+    test.assert_eq(mcp2518fd.errors_or_idle(LimitLink { c: chip(), left: 1 }).state,
+        embedded_hal.CAN_ERROR_ACTIVE)
+    let e = chip()
+    test.assert(mcp2518fd.open_simple(link(e), 40000000, 500000, 0))
+    word_set(e, 0x034, (1 << 20) | (9 << 8))
+    test.assert_eq(mcp2518fd.errors_or_idle(LimitLink { c: e, left: 1 }).tx, 0)
+
+@test
+fn test_the_bit_rate_is_read_back_from_the_timing_and_the_clock() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // 0 before the part is open.
+    test.assert_eq(mcp2518fd.bitrate_read(l, 40000000), 0)
+    test.assert(mcp2518fd.open_simple(l, 40000000, 500000, 0))
+    test.assert_eq(mcp2518fd.bitrate_read(l, 40000000), 500000)
+    // 4 MHz and the PLL make 40 MHz.
+    let d = chip()
+    let cfg = Mcp2518Config { mode: 0, pll: true, spi_hz: 1000000, retries: 0, accept_all: true, irq_mask: 0,
+                              int_pins: false, sample_nominal: 800, sample_data: 800 }
+    test.assert_eq(mcp2518fd.open_code(link(d), 4000000, 1000000, 0, cfg), 0)
+    test.assert_eq(mcp2518fd.bitrate_read(link(d), 4000000), 1000000)
+    d.st.insert(41, 0)
+    test.assert_eq(mcp2518fd.bitrate_read(link(d), 4000000), 0)
+    test.assert_eq(mcp2518fd.bitrate_read(LimitLink { c: chip(), left: 2 }, 40000000), 0)
+    // A clock the part does not answer for.
+    let e = chip()
+    test.assert(mcp2518fd.open_simple(link(e), 40000000, 500000, 0))
+    test.assert_eq(mcp2518fd.bitrate_read(LimitLink { c: e, left: 2 }, 40000000), 0)
+
+@test
+fn test_the_queues_are_idle_only_in_an_open_part() [io, hw]
+    let c = chip()
+    let l = link(c)
+    // Configuration mode: false, whatever the requests say.
+    test.assert(not mcp2518fd.tx_idle(l))
+    test.assert(mcp2518fd.open_simple(l, 40000000, 500000, 0))
+    test.assert(mcp2518fd.tx_idle(l))
+    test.assert_eq(mcp2518fd.tx_pending(l), 0)
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 0), 0)
+    test.assert(not mcp2518fd.tx_idle(l))
+    test.assert_eq(mcp2518fd.tx_pending(l), 1)
+    test.assert_eq(mcp2518fd.send_classic(l, 1, frame8(), 0), 0)
+    test.assert_eq(mcp2518fd.tx_pending(l), 5)
+    bus_send(c, false)
+    c.st.insert(14, 0)
+    test.assert(mcp2518fd.tx_idle(l))
+    c.st.insert(41, 0)
+    test.assert(not mcp2518fd.tx_idle(l))
+    test.assert_eq(mcp2518fd.tx_pending(l), -1)
+    test.assert(not mcp2518fd.tx_idle(LimitLink { c: chip(), left: 0 }))
+
+@test
+fn test_every_pending_frame_is_aborted_and_the_bit_is_waited_for() [io, hw]
+    let c = chip()
+    let l = link(c)
+    test.assert(mcp2518fd.open_simple(l, 40000000, 500000, 0))
+    test.assert_eq(mcp2518fd.send_classic(l, 0, frame8(), 0), 0)
+    log_clear(c)
+    test.assert(mcp2518fd.tx_abort_all(l))
+    // Read byte 3, write it with ABAT, and read it until ABAT is clear: the
+    // double shows ABAT twice.
+    log_is(c, [0x30, 0x03, 1, -1, 0x20, 0x03, 0x0E, 0, -1,
+        0x30, 0x03, 1, -1, 0x30, 0x03, 1, -1, 0x30, 0x03, 1, -1])
+    test.assert_eq(at(c.st, 7), 0)
+    test.assert_eq(at(c.st, 9), 0)
+    test.assert_eq(mcp2518fd.tx_pending(l), 0)
+
+@test
+fn test_an_abort_that_never_completes_or_cannot_be_asked_is_reported() [io, hw]
+    let c = chip()
+    c.st.insert(61, 1)
+    test.assert(not mcp2518fd.tx_abort_all(link(c)))
+    test.assert_eq(at(c.st, 21), 50000)
+    let d = chip()
+    d.st.insert(41, 0)
+    test.assert(not mcp2518fd.tx_abort_all(link(d)))
+    // The part stops answering at the write and at the poll.
+    for left in [1, 2]
+        test.assert(not mcp2518fd.tx_abort_all(LimitLink { c: chip(), left: left }))
+
+// ── The device type over absent hardware ─────────────────────────────
+//
+// The host's handles are absent hardware: the SPI bus reads zeros and the
+// pins do nothing.  This runs the lines of the type that forward to the
+// functions above, and the guards of the trait methods.
+
+fn board() -> Mcp2518
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 28), 29)
+    Mcp2518.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w, 40000000)
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    let p = board()
+    test.assert_eq(p.open_with(500000, 0, mcp2518fd.config_default()), -1)
+    test.assert_eq(p.send_in(0, frame8(), 0), -2)
+    var data = fd_data(4)
+    test.assert_eq(p.send_fd_in(0, canframe.fd_frame(1, 4, false), var data, 0), -2)
+    test.assert(canframe.fd_is_none(p.receive_fd(var data)))
+    test.assert(p.receive_by_pin() == None)
+    test.assert_eq(p.event().seq, -1)
+    test.assert_eq(int_or(p.mode()), 0)
+    test.assert(not p.set_mode(4))
+    test.assert(not p.set_filter(0, 1, 1, false, true, 1))
+    test.assert(not p.clear_filter(40))
+    test.assert_eq(p.flags(), 0)
+    test.assert(p.enable_flags(2))
+    test.assert(p.clear_flags(8))
+    test.assert_eq(p.int_level(), 0)
+    test.assert(p.abort_all())
+    test.assert(p.gpio_dir(0, true))
+    test.assert(p.gpio_write(0, 1))
+    test.assert_eq(p.gpio_read(0), 0)
+    test.assert_eq(int_or(p.ecc()), 0)
+    test.assert_eq(int_or(p.devid()), 0)
+    let l = p.as_link()
+    test.assert_eq(l.w.cs ?? -1, 28)
+
+@test
+fn test_the_can_bus_over_absent_hardware() [io, hw]
+    let p = board()
+    test.assert(not p.open(500000, 0))
+    test.assert(not p.open(500000, 1))
+    test.assert(not p.open(500000, 2))
+    test.assert(not p.send(frame8()))
+    test.assert(p.receive() == None)
+    test.assert(p.tx_done())
+    test.assert_eq(p.errors().state, embedded_hal.CAN_ERROR_ACTIVE)
+    test.assert_eq(p.errors().tx, 0)
+    test.assert(p.bitrate() > 0)
+
+// ── The bus and pin framing over doubles of the traits ───────────────
+
+struct FakeSpi
+    ev: HashMap<Int, Int>
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.ev.insert(100, freq)
+        self.ev.insert(101, mode)
+
+    fn transfer(self, b: Int) -> Int [hw]
+        let n = at(self.ev, 99)
+        self.ev.insert(n, b)
+        self.ev.insert(99, n + 1)
+        0x80 + n
+
+    fn write(self, data: [u8]) [hw]
+        let _ = data.len()
+
+    fn read(self, n: Int) -> [u8] [hw]
+        system
+            return []
+
+struct FakePins
+    ev: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+    levels: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        let n = at(self.ev, 99)
+        self.ev.insert(n, pin * 10 + val)
+        self.ev.insert(99, n + 1)
+        self.levels.insert(pin, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn fake_spi() -> FakeSpi
+    FakeSpi { ev: HashMap.new() }
+
+@tier(app)
+fn fake_pins() -> FakePins
+    FakePins { ev: HashMap.new(), modes: HashMap.new(), levels: HashMap.new() }
+
+@test
+fn test_a_transaction_drives_chip_select_low_around_the_bytes() [io, hw]
+    let bus = fake_spi()
+    let pins = fake_pins()
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 28), 29)
+    var dst: SpiBuf = Vec.new()
+    // A READ of 2 bytes: the 2-byte header, then two bytes clocked in.
+    test.assert(mcp2518fd.spi_exchange(bus, pins, w, bytes_of([0x30, 0x04]), 2, var dst))
+    test.assert_eq(dst.len(), 2)
+    test.assert_eq(dst[0] as Int, 0x82)
+    test.assert_eq(dst[1] as Int, 0x83)
+    // The first byte out is the command, the filler out while reading is 0.
+    test.assert_eq(at(bus.ev, 0), 0x30)
+    test.assert_eq(at(bus.ev, 1), 0x04)
+    test.assert_eq(at(bus.ev, 2), 0)
+    // CS (pin 28) low, then high after the last byte.
+    test.assert_eq(at(pins.ev, 0), 280)
+    test.assert_eq(at(pins.ev, 1), 281)
+    // A wiring with no chip select drives no pin and reads nothing.
+    var other: SpiBuf = Vec.new()
+    test.assert(not mcp2518fd.spi_exchange(bus, pins, dev_bus.wiring_i2c(0, 0x40), bytes_of([0x30, 0x04]), 2, var other))
+    test.assert_eq(other.len(), 0)
+    // A read longer than the buffer is refused before CS moves.
+    test.assert(not mcp2518fd.spi_exchange(bus, pins, w, bytes_of([0x30, 0x04]), 97, var other))
+    test.assert_eq(at(pins.ev, 99), 2)
+
+@test
+fn test_the_bus_is_made_ready_with_chip_select_high_and_mode_0() [io, hw]
+    let bus = fake_spi()
+    let pins = fake_pins()
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 28), 29)
+    test.assert(mcp2518fd.spi_ready(bus, pins, w, 8500000))
+    test.assert_eq(at(bus.ev, 100), 8500000)
+    test.assert_eq(at(bus.ev, 101), 0)
+    // CS is driven high first, then made an output; INT is an input with a
+    // pull-up.
+    test.assert_eq(at(pins.ev, 0), 281)
+    test.assert_eq(at(pins.modes, 28), 1)
+    test.assert_eq(at(pins.modes, 29), 2)
+    // No chip select, no setup; no INT pin, none made an input.
+    test.assert(not mcp2518fd.spi_ready(bus, pins, dev_bus.wiring_i2c(0, 0x40), 1000000))
+    let other = fake_pins()
+    test.assert(mcp2518fd.spi_ready(bus, other, dev_bus.wiring_spi(0, 5), 1000000))
+    test.assert_eq(other.modes.len(), 1)
+
+@test
+fn test_the_int_pin_level() [io, hw]
+    let pins = fake_pins()
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 28), 29)
+    pins.levels.insert(29, 1)
+    test.assert_eq(mcp2518fd.irq_level_of(pins, w), 1)
+    pins.levels.insert(29, 0)
+    test.assert_eq(mcp2518fd.irq_level_of(pins, w), 0)
+    test.assert_eq(mcp2518fd.irq_level_of(pins, dev_bus.wiring_spi(0, 28)), -1)
+
+// ── The INT pin, awaited ─────────────────────────────────────────────
+
+struct FakeEdge
+    ev: HashMap<Int, Int>
+
+impl AsyncEdge[hw] for FakeEdge
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int [hw]
+        self.ev.insert(1, pin)
+        self.ev.insert(2, edge)
+        self.ev.insert(3, at(self.ev, 3) + 1)
+        at(self.ev, 4)
+
+    fn edge_disarm(self, pin: Int) -> Bool [hw]
+        self.ev.insert(5, pin)
+        at(self.ev, 6) == 1
+
+    fn edge_irqs(self) -> Int [hw]
+        at(self.ev, 7)
+
+@tier(app)
+fn fake_edge() -> FakeEdge
+    FakeEdge { ev: HashMap.new() }
+
+@test
+fn test_the_int_pin_arms_a_falling_edge_when_it_is_high() [io, hw, async]
+    let edge = fake_edge()
+    let pins = fake_pins()
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 28), 29)
+    pins.levels.insert(29, 1)
+    let line = mcp2518fd_irq.line(edge, pins, w)
+    let f = core.rt.future_new()
+    test.assert_eq(line.ready_arm(f), 0)
+    test.assert_eq(at(edge.ev, 1), 29)
+    test.assert_eq(at(edge.ev, 2), 1)
+    test.assert_eq(at(edge.ev, 3), 1)
+    test.assert(not core.rt.future_is_ready(f))
+    // The edge source's refusal is passed on.
+    edge.ev.insert(4, -3)
+    test.assert_eq(line.ready_arm(f), -3)
+    // Disarm and the interrupt count come from the edge source.
+    edge.ev.insert(6, 1)
+    test.assert(line.ready_disarm())
+    test.assert_eq(at(edge.ev, 5), 29)
+    edge.ev.insert(7, 4)
+    test.assert_eq(line.ready_irqs(), 4)
+    core.rt.future_drop(f)
+
+@test
+fn test_a_pin_already_low_resolves_the_future_at_once() [io, hw, async]
+    let edge = fake_edge()
+    let pins = fake_pins()
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 28), 29)
+    pins.levels.insert(29, 0)
+    let line = mcp2518fd_irq.line(edge, pins, w)
+    let f = core.rt.future_new()
+    test.assert_eq(line.ready_arm(f), 0)
+    test.assert(core.rt.future_is_ready(f))
+    test.assert_eq(core.rt.future_await(f), 0)
+    // The edge source was not asked, and a second arm of a resolved Future is
+    // refused.
+    test.assert_eq(at(edge.ev, 3), 0)
+    test.assert_eq(line.ready_arm(f), -2)
+    core.rt.future_reset(f)
+    test.assert_eq(line.ready_arm(f), 0)
+    core.rt.future_drop(f)
+
+@test
+fn test_a_wiring_with_no_int_pin_has_no_line_to_await() [io, hw, async]
+    let edge = fake_edge()
+    let pins = fake_pins()
+    let line = mcp2518fd_irq.line(edge, pins, dev_bus.wiring_spi(0, 28))
+    let f = core.rt.future_new()
+    test.assert_eq(line.ready_arm(f), -1)
+    test.assert(not line.ready_disarm())
+    test.assert_eq(at(edge.ev, 3), 0)
+    core.rt.future_drop(f)

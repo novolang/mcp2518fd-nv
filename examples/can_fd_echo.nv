@@ -1,0 +1,95 @@
+/* can_fd_echo.nv: a node on a CAN FD bus behind an MCP2518FD breakout, for an
+ * nRF52840 DK or an nRF54LM20 DK
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          mcp2518fd-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The breakout's SCK, MOSI and MISO go to the board's SPI pins, its chip
+ * select to pin 28 and its INT pin to pin 29.  The breakout carries a 40 MHz
+ * crystal and a CAN transceiver, and its CANH and CANL go to the bus.  The
+ * program opens the part at 500 kbit/s with a data phase of 2 Mbit/s, sends an
+ * FD frame with the identifier 0x123, bit rate switching and 12 data bytes once
+ * a second, and prints every frame it receives over the board's UART:
+ *
+ *     rx id=291 len=12 fd=1
+ *
+ * Effects the program declares: [hw], for the SPI bus, the pins, the UART and
+ * the timer.
+ *
+ * Boards: the nRF52840 DK drives SPI with SPIM2 (SCK P1.15, MISO P1.14, MOSI
+ * P1.13) and the nRF54LM20 DK with SPIM21 (SCK P1.07, MOSI P1.06, MISO P1.05).
+ * With no part on the bus the program prints "mcp2518fd: no answer".  The part
+ * has not been read on a board.
+ */
+use embedded_hal.{ BoardSpi, BoardGpio }
+use dev_bus
+use canframe
+use mcp2518fd
+use mcp2518fd.{ Mcp2518 }
+
+// The pins of the chip select and of INT, and the crystal of the breakout.
+const CS_PIN = 28
+const INT_PIN = 29
+const XTAL_HZ = 40000000
+
+// A label and a number, written without building a string.
+@tier(embedded)
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+// Sends the frame with the counter `n` in its 12 bytes.
+@tier(embedded)
+fn send_counter(can: Mcp2518, n: Int) [hw]
+    var out: Vec[u8; 64] = Vec.new()
+    for i in 0..12
+        let _ = out.push(((n + i) & 0xFF) as u8)
+    let code = can.send_fd_in(0, canframe.fd_frame(0x123, 12, true), var out, n)
+    if code != 0
+        field("tx code=", code)
+        hal.uart.write("\n")
+
+// Prints one received frame, if there is one.
+@tier(embedded)
+fn print_rx(can: Mcp2518) [hw]
+    var inb: Vec[u8; 64] = Vec.new()
+    let h = can.receive_fd(var inb)
+    if canframe.fd_is_frame(h)
+        hal.uart.write("rx")
+        field(" id=", h.id)
+        field(" len=", h.len)
+        field(" fd=", h.flags & canframe.CAN_FD_FLAG_FD)
+        hal.uart.write("\n")
+
+// Reads the transmit events the part has kept, so that its event FIFO does not
+// stay full: the part keeps one for every frame it sends.
+@tier(embedded)
+fn drain_events(can: Mcp2518) [hw]
+    for _k in 0..mcp2518fd.TEF_DEPTH
+        let e = can.event()
+        if e.seq < 0
+            return
+
+@tier(embedded)
+fn main() [hw]
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, CS_PIN), INT_PIN)
+    let can = Mcp2518.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w, XTAL_HZ)
+    // The part needs its supply and crystal settled before the first command.
+    hal.timer.delay_ms(10)
+    if can.open_with(500000, 2000000, mcp2518fd.config_default()) != 0
+        hal.uart.write("mcp2518fd: no answer\n")
+        return
+    var n = 0
+    loop
+        // Ten times a second the FIFO is read; once a second a frame is sent.
+        for _tick in 0..10
+            print_rx(can)
+            hal.timer.delay_ms(100)
+        send_counter(can, n)
+        drain_events(can)
+        n = n + 1

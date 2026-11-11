@@ -1,0 +1,67 @@
+// mcp2518fd_irq — the INT pin of an MCP2518FD, awaited on a microcontroller.
+//
+// The part completes a transmit, a receive and an error in the background and
+// says so on its INT pin, which is open-drain and active low and stays low
+// while an enabled flag of CiINT is set (Register 3-14).  A task at the
+// embedded tier cannot call an `async fn` (E4002), so the line implements
+// devices-nv's `AsyncDeviceReady`: `ready_arm` starts the wait and answers at
+// once, the board's interrupt resolves the Future the caller owns, and the
+// caller awaits it with `core.rt.future_await` and then reads the flags with
+// the package's functions.
+//
+// The pin is a level, and an edge is not: a flag set before the arm leaves
+// the pin low and produces no edge to wait for.  `ready_arm` therefore reads
+// the pin first and, when it is already low, resolves the Future at once with
+// 0 and reports no interrupt.  Otherwise it arms the falling edge on the
+// board's `AsyncEdge`.
+//
+// Which flags drive the pin is the `irq_mask` of `Mcp2518Config`.  A task
+// that has handled a flag clears it (`int_clear` for the flags software
+// clears, a read of the FIFO for the others) before it arms again, or the pin
+// stays low and every arm resolves at once.
+
+use embedded_hal.{ GpioOut, AsyncEdge }
+use dev_bus.{ DeviceWiring, AsyncDeviceReady }
+
+// The INT pin of a part on a board: the board's edge source, its GPIO, and
+// the pin the wiring names.  A struct with a generic field cannot be a
+// `@value`, so the line is one cell of the arena, built once at start-up by
+// `line`.
+pub struct Mcp2518Line<E: AsyncEdge[e], G: GpioOut>
+    edge: E
+    pins: G
+    pin: Int
+
+// The line of a part whose INT pin is `w.irq`.  A wiring with no INT pin gets
+// the pin -1, and every arm of its line is refused.
+pub fn line<E: AsyncEdge[e], G: GpioOut>(edge: E, pins: G, w: DeviceWiring) -> Mcp2518Line<E, G>
+    var pin = -1
+    if let Some(irq) = w.irq
+        pin = irq
+    system
+        return Mcp2518Line { edge: edge, pins: pins, pin: pin }
+
+impl AsyncDeviceReady[e, hw] for Mcp2518Line
+    // Arms the wait for the INT pin to go low.  0 when armed or when the
+    // pin was already low, which resolves the Future with 0 at once; -1 for
+    // a wiring with no INT pin; -2 when the Future is already resolved; and
+    // the edge source's refusal otherwise.
+    fn ready_arm(self, f: Future) -> Int [e, hw]
+        if self.pin < 0
+            return -1
+        if core.rt.future_is_ready(f)
+            return -2
+        if self.pins.get(self.pin) == 0
+            core.rt.future_set(f, 0)
+            return 0
+        self.edge.edge_arm(self.pin, 1, f)
+
+    // Lets go of the wait: whether it was still armed.
+    fn ready_disarm(self) -> Bool [e, hw]
+        if self.pin < 0
+            return false
+        self.edge.edge_disarm(self.pin)
+
+    // The interrupts the pin has taken.
+    fn ready_irqs(self) -> Int [e, hw]
+        self.edge.edge_irqs()

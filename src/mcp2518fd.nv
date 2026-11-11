@@ -1,0 +1,1436 @@
+// mcp2518fd — Microchip's MCP2518FD, an external CAN FD controller with an
+// SPI interface, as embedded-hal-nv's `CanBus` for classic frames and, for
+// FD frames, filters, the transmit event FIFO and the interrupt flags, the
+// package's own functions beside it.
+//
+// The facts below are from Microchip's data sheet "MCP2518FD: External CAN
+// FD Controller with SPI Interface", DS20006027B, December 2020 (the sheet's
+// own number; the brief named DS20005688), and the "MCP25XXFD Family
+// Reference Manual", DS20005678E.  A section, register or table is named
+// where a fact is used.
+//
+// The SPI instructions (Table 4-1), a 4-bit command and a 12-bit address in
+// two bytes, high byte first, then the data:
+//
+//   0x0 0x000       RESET      registers to their reset values, Configuration mode
+//   0x3 a           READ       from address a, the address advancing
+//   0x2 a           WRITE      from address a, the address advancing
+//   0xB, 0xA, 0xC   the CRC forms: READ_CRC, WRITE_CRC, WRITE_SAFE (NOT IMPLEMENTED)
+//
+// The address space is 32-bit registers, the least significant byte at the
+// lowest address (Section 3.0): the CAN FD module's registers from 0x000,
+// the message RAM from 0x400 to 0xBFF (2 KB) and the part's own registers
+// from 0xE00.  A RAM access is word-oriented (Section 4.2): the address
+// and the length are multiples of 4.
+//
+// The registers this driver uses (Tables 3-1 and 3-2):
+//
+//   0xE00 OSC       0xE04 IOCON    0xE0C ECCCON    0xE10 ECCSTAT   0xE14 DEVID
+//   0x000 CiCON     0x004 CiNBTCFG 0x008 CiDBTCFG  0x00C CiTDC     0x01C CiINT
+//   0x030 CiTXREQ   0x034 CiTREC   0x040 CiTEFCON  0x044 CiTEFSTA  0x048 CiTEFUA
+//   0x050 CiTXQCON  0x054 CiTXQSTA 0x058 CiTXQUA
+//   0x05C + 12 (m - 1)  CiFIFOCONm, + 4 CiFIFOSTAm, + 8 CiFIFOUAm
+//   0x1D0 + 4 (n / 4)   CiFLTCONn, four filters of one byte each
+//   0x1F0 + 8 n  CiFLTOBJn, 0x1F4 + 8 n  CiMASKn
+//
+// The message objects (Tables 3-5 and 3-6), in RAM as little-endian words:
+//
+//   T0/R0  SID[10:0] in bits 10:0, EID[17:0] in bits 28:11, SID11 in bit 29
+//   T1     DLC 3:0, IDE 4, RTR 5, BRS 6, FDF 7, ESI 8, SEQ 31:9
+//   R1     DLC 3:0, IDE 4, RTR 5, BRS 6, FDF 7, ESI 8, FILHIT 15:11
+//   T2..   data bytes, byte 0 in the low byte of the word
+//
+// The layout this driver configures is fixed.  Message RAM: the transmit
+// event FIFO of 8 objects of 8 bytes, the transmit queue of 4 objects of 72
+// bytes (an 8-byte header and 64 data bytes), FIFO 1 as the receive FIFO of
+// 16 objects of 72 bytes and FIFO 2 as a transmit FIFO of 4 objects of 72
+// bytes: 64 + 288 + 1152 + 288 = 1792 of the 2048 bytes.  The driver does
+// not compute an object's address: the user address registers (CiTXQUA,
+// CiFIFOUAm, CiTEFUA) hold it as an offset from 0x400 (Section 3.2).
+//
+// Fix kept: the SPI clock is at most 0.85 times half the system clock
+// (Table 4-1, Note 1).  At power-up with the oscillator at 40 MHz and no
+// PLL that is 17 MHz, and with a 4 MHz crystal and the PLL off 1.7 MHz.
+// Zephyr's `can_mcp251xfd.c` clamps the clock to 17/40 of the oscillator
+// until the PLL has locked; this driver opens the bus at that clock and
+// raises it to the requested one after the oscillator is ready.
+//
+// Fix kept: RESET is only valid in Configuration mode (Section 4.1.1), so
+// the driver requests Configuration mode first.  After RESET it waits 5 ms,
+// as Zephyr does ("occasional init issue"), and then polls CiCON until it
+// reads its reset value 0x04980760, because a read while the oscillator is
+// restarting answers 0x00 or 0xFF.  An absent part is therefore a refusal
+// at the first read, never a part that reads as in a mode.
+//
+// Fix kept: the bit fields of IOCON are written with single-byte writes
+// (Section 4.1.3 and the errata DS80000789): a 32-bit write of IOCON clears
+// GPIO latches that were not named.
+//
+// Fix kept: ECC is enabled in Configuration mode and the whole message RAM
+// is written with zeros before the mode is left (Reference Manual, Example
+// 3-2), so that no object is read before it has been written with its parity
+// bits.
+//
+// Fix kept: a mode request is checked in CiCON.OPMOD.  A change to Normal
+// mode waits for 11 recessive bits on the bus, so the driver polls every
+// 100 us for 50 ms.  The request to Configuration mode sets ABAT too, which
+// aborts pending transmissions (the `mcp2517` crate does the same).
+//
+// Fix kept: a receive reads CiFIFOSTA1 and CiFIFOUA1 in one 8-byte read,
+// then the object at 0x400 + UA, then increments the tail with UINC
+// (CiFIFOCON1 byte 1, bit 0).  A transmit reads CiTXQSTA and CiTXQUA together,
+// checks TXQNIF, writes the object, and sets UINC and TXREQ together in
+// CiTXQCON byte 1, as Zephyr does.
+//
+// Fix kept: the part's DEVID register distinguishes the MCP2517FD from the
+// MCP2518FD (the sheet's revision history), but the sheet gives no values
+// for it.  The driver reads it and does not test it.
+//
+// The driver keeps no state: the mode, the layout and the timing are read
+// from the part when they are needed.  The SPI bus, the chip-select and
+// interrupt pins and the timer enter through `FdLink`, which `Mcp2518Link`
+// implements over a board's handles and a test implements over a double of
+// the part.
+
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut, Timer, CanBus, CanBusFrame, CanBusErrors }
+use dev_bus.{ DeviceWiring }
+use canframe
+use canframe.{ CanFdFrame }
+
+// A buffer for one SPI instruction: two header bytes and up to 74 bytes of
+// message object, with room to spare.
+pub alias SpiBuf = Vec[u8; 96]
+
+// The instructions' command nibbles, in the high nibble of the first byte.
+let CMD_WRITE = 0x20
+let CMD_READ  = 0x30
+
+// The registers.
+let REG_CON      = 0x000
+let REG_NBTCFG   = 0x004
+let REG_DBTCFG   = 0x008
+let REG_TDC      = 0x00C
+let REG_INT      = 0x01C
+let REG_TXREQ    = 0x030
+let REG_TREC     = 0x034
+let REG_TEFCON   = 0x040
+let REG_TEFSTA   = 0x044
+let REG_TXQCON   = 0x050
+let REG_FIFOCON1 = 0x05C
+let REG_FIFOSTA1 = 0x060
+let REG_FIFOCON2 = 0x068
+let REG_FLTCON0  = 0x1D0
+let REG_FLTOBJ0  = 0x1F0
+let REG_MASK0    = 0x1F4
+let REG_OSC      = 0xE00
+let REG_IOCON    = 0xE04
+let REG_ECCCON   = 0xE0C
+let REG_ECCSTAT  = 0xE10
+let REG_DEVID    = 0xE14
+
+// The start of the message RAM.
+pub const RAM_START = 0x400
+
+// The size of the message RAM in bytes.
+pub const RAM_SIZE = 2048
+
+// The objects of the transmit event FIFO that `open_code` configures (see
+// above).
+pub const TEF_DEPTH = 8
+
+// The objects of the transmit queue.
+pub const TXQ_DEPTH = 4
+
+// The objects of the receive FIFO, FIFO 1.
+pub const RXF_DEPTH = 16
+
+// The objects of the transmit FIFO, FIFO 2.
+pub const TXF_DEPTH = 4
+
+// The payload of one transmit or receive object in bytes.
+pub const PAYLOAD_BYTES = 64
+
+// The size of an object with a 64-byte payload: an 8-byte header and 64 data
+// bytes.
+pub const OBJECT_BYTES = 72
+
+// The bytes of RAM the layout takes: 8 * 8 + 4 * 72 + 16 * 72 + 4 * 72.
+pub const RAM_USED = 1792
+
+// CiCON as `open_code` writes it with a request for Configuration mode:
+// ISOCRCEN, PXEDIS, WAKFIL, WFT 3, TXQEN and STEF, which is the sheet's
+// reset value without the read-only OPMOD bits.
+let CON_BASE  = 0x04180760
+let CON_RTXAT = 0x00010000
+
+// The value CiCON reads after a reset (Register 3-7): Configuration mode in
+// REQOP and in OPMOD, TXQEN, STEF, WFT 3, WAKFIL, PXEDIS and ISOCRCEN.
+pub const CON_RESET = 0x04980760
+
+// The operating modes of CiCON.REQOP and OPMOD (Register 3-7).
+// Normal CAN FD mode: classic and FD frames, bit rate switching.
+pub const MCP_MODE_NORMAL_FD = 0
+// Sleep: the oscillator stops.
+pub const MCP_MODE_SLEEP = 1
+// Internal loopback: a transmitted frame goes to the part's own receive
+// FIFO, and nothing reaches the bus.
+pub const MCP_MODE_LOOPBACK = 2
+// Listen-only: the part receives every frame and never drives the bus.
+pub const MCP_MODE_LISTEN = 3
+// Configuration: the only mode in which the layout and the timing are written.
+pub const MCP_MODE_CONFIG = 4
+// External loopback: a transmitted frame goes to the bus and is received.
+pub const MCP_MODE_LOOPBACK_EXT = 5
+// Normal CAN 2.0 mode: classic frames only, possible error frames on FD frames.
+pub const MCP_MODE_NORMAL_20 = 6
+// Restricted operation: the part receives and acknowledges nothing.
+pub const MCP_MODE_RESTRICTED = 7
+
+// The interrupt flags of CiINT, bits 15:0 (Register 3-14).  The enable of
+// a flag is the bit 16 above it.
+// Transmit FIFO interrupt pending.
+pub const INT_TXIF = 0x0001
+// Receive FIFO interrupt pending.
+pub const INT_RXIF = 0x0002
+// The time base counter overflowed.
+pub const INT_TBCIF = 0x0004
+// The operation mode changed.
+pub const INT_MODIF = 0x0008
+// The transmit event FIFO has an interrupt pending.
+pub const INT_TEFIF = 0x0010
+// An ECC error was detected.
+pub const INT_ECCIF = 0x0100
+// An SPI command with a bad CRC was seen.
+pub const INT_SPICRCIF = 0x0200
+// A transmit attempt was exhausted.
+pub const INT_TXATIF = 0x0400
+// A receive FIFO overflowed.
+pub const INT_RXOVIF = 0x0800
+// A system error occurred.
+pub const INT_SERRIF = 0x1000
+// A CAN bus error occurred.
+pub const INT_CERRIF = 0x2000
+// The bus woke the part.
+pub const INT_WAKIF = 0x4000
+// An invalid message was received.
+pub const INT_IVMIF = 0x8000
+
+// The clock `link_setup` is asked for before the oscillator is ready: the
+// sheet's limit is 0.85 * SYSCLK / 2 (Table 4-1, Note 1), which Zephyr
+// states as 17/40 of the oscillator.
+let SAFE_NUM = 17
+let SAFE_DEN = 40
+
+// The most the sheet allows on SCK (Features).
+let SPI_MAX_HZ = 20000000
+
+// After RESET the oscillator restarts; Zephyr waits 5 ms and polls for up to
+// 30 ms.
+let RESET_WAIT_US = 5000
+let RESET_STEP_US = 500
+let RESET_TRIES   = 60
+
+// The oscillator ready poll: 1 ms steps for up to 100 ms, and 200 us for the
+// PLL to settle after PLLRDY (Zephyr).
+let OSC_STEP_US   = 1000
+let OSC_TRIES     = 100
+let PLL_SETTLE_US = 200
+
+// A mode change waits for the bus to be idle, 11 recessive bits, which is
+// 1.1 ms at 10 kbit/s.  The driver polls every 100 us for 50 ms.
+let MODE_STEP_US = 100
+let MODE_TRIES   = 500
+
+// A FIFO reset after the layout is written is done by the part on leaving
+// Configuration mode (FRESET is set in Configuration mode, Register 3-26).
+
+// ── What the part is told at open ────────────────────────────────────
+
+// The settings `open_code` writes.  `mode` is one of the `MCP_MODE_*`
+// values the part runs in afterwards.  `pll` multiplies a 4 MHz crystal by
+// 10.  `spi_hz` is the SPI clock asked for once the oscillator is ready; it
+// is limited to the sheet's 0.85 * SYSCLK / 2 and 20 MHz.  `retries` is 0
+// for unlimited retransmission, 1 for three attempts and 2 for one attempt
+// (CiCON.RTXAT and the TXAT fields).  `accept_all` makes filter 0 pass every
+// frame to the receive FIFO; with it false no filter is enabled until
+// `filter_set` writes one.  `irq_mask` is the set of `INT_*` flags that drive
+// the INT pin.  `int_pins` makes GPIO0 the INT0 output and GPIO1 the INT1
+// output (Register 3-2).  `sample_nominal` and `sample_data` are the sample
+// points in permille.
+pub @value
+struct Mcp2518Config
+    mode: Int
+    pll: Bool
+    spi_hz: Int
+    retries: Int
+    accept_all: Bool
+    irq_mask: Int
+    int_pins: Bool
+    sample_nominal: Int
+    sample_data: Int
+
+// The settings `open_code` uses when the program names none: Normal CAN FD
+// mode, no PLL, 10 MHz on SCK, unlimited retransmission, every frame
+// received, the receive interrupt on the INT pin, the pins as GPIO and an
+// 80 % sample point in both phases.
+//
+// ```novo
+// use mcp2518fd
+//
+// fn main() [io]
+//     let c = mcp2518fd.config_default()
+//     println("${c.mode} ${c.spi_hz} ${c.sample_nominal}")   // 0 10000000 800
+// ```
+pub fn config_default() -> Mcp2518Config
+    Mcp2518Config { mode: MCP_MODE_NORMAL_FD, pll: false, spi_hz: 10000000, retries: 0, accept_all: true,
+                    irq_mask: INT_RXIF, int_pins: false, sample_nominal: 800, sample_data: 800 }
+
+// ── The link ─────────────────────────────────────────────────────────
+
+// What the driver needs from the board.  `link_xfer` runs one SPI
+// transaction: CS low, the bytes of `tx`, `n` bytes read into `dst`, CS
+// high; it answers `false` for a wiring with no chip select.  `link_wait`
+// waits `us` microseconds.  `link_irq` is the level of the INT pin, 0 or 1,
+// and -1 for a wiring with no interrupt pin.  `link_setup` makes the bus
+// and the pins ready at `hz` and answers whether the wiring has a chip
+// select.
+pub trait FdLink
+    fn link_xfer(self, tx: SpiBuf, n: Int, var dst: SpiBuf) -> Bool [hw]
+    fn link_wait(self, us: Int) [hw]
+    fn link_irq(self) -> Int [hw]
+    fn link_setup(self, hz: Int) -> Bool [hw]
+
+// ── Bit timing ───────────────────────────────────────────────────────
+//
+// A bit is a synchronisation segment of 1 time quantum, TSEG1 quanta
+// (propagation and phase 1) and TSEG2 quanta (phase 2); a quantum is
+// BRP / SYSCLK, so the rate is SYSCLK / (BRP * (1 + TSEG1 + TSEG2)).  The
+// sample point is at the end of TSEG1.  The nominal phase has BRP 1 to 256,
+// TSEG1 2 to 256, TSEG2 1 to 128 and 4 to 385 quanta a bit (Reference
+// Manual Table 3-3); the data phase has BRP 1 to 256, TSEG1 1 to 32, TSEG2 1
+// to 16 and 3 to 49 quanta a bit (Table 3-4).  The registers hold each
+// length less one (Registers 3-8 and 3-9).
+
+// One phase's bit timing, in whole time quanta.  `brp` 0 means that no
+// timing fits.
+pub @value
+struct Mcp2518Timing
+    brp: Int
+    tseg1: Int
+    tseg2: Int
+    sjw: Int
+
+// A timing that fits nothing.
+pub fn timing_none() -> Mcp2518Timing
+    Mcp2518Timing { brp: 0, tseg1: 0, tseg2: 0, sjw: 0 }
+
+// The smallest prescaler that makes `rate` exactly from `fsys` with a bit of
+// `n_min` to `n_max` quanta, a sample point nearest `sample_permille` of the
+// bit, TSEG1 of `t1_min` to `t1_max` and TSEG2 of 1 to `t2_max`, and the widest
+// synchronisation jump the segments allow, which is TSEG2 (the limit of the
+// jump is the limit of TSEG2 in both phases).  The reference manual picks the
+// smallest prescaler "to maximize resolution" (Table 3-3).
+fn timing_solve(fsys: Int, rate: Int, sample_permille: Int, n_min: Int, n_max: Int, t1_min: Int,
+                t1_max: Int, t2_max: Int) -> Mcp2518Timing
+    if fsys <= 0 or rate <= 0 or sample_permille <= 0 or sample_permille >= 1000
+        return timing_none()
+    for brp in 1..257
+        if fsys % (brp * rate) == 0
+            let n = fsys / (brp * rate)
+            if n >= n_min and n <= n_max
+                let t1 = (n * sample_permille + 500) / 1000 - 1
+                let t2 = n - 1 - t1
+                if t1 >= t1_min and t1 <= t1_max and t2 >= 1 and t2 <= t2_max
+                    return Mcp2518Timing { brp: brp, tseg1: t1, tseg2: t2, sjw: t2 }
+    timing_none()
+
+// The nominal bit timing for `rate` at the system clock `fsys` with the
+// sample point `sample_permille`.
+//
+// ```novo
+// use mcp2518fd
+//
+// fn main() [io]
+//     // The reference manual's example: 500 kbit/s at 40 MHz, 80 %.
+//     let t = mcp2518fd.nominal_timing(40000000, 500000, 800)
+//     println("${t.brp} ${t.tseg1} ${t.tseg2} ${t.sjw}")   // 1 63 16 16
+// ```
+pub fn nominal_timing(fsys: Int, rate: Int, sample_permille: Int) -> Mcp2518Timing
+    timing_solve(fsys, rate, sample_permille, 4, 385, 2, 256, 128)
+
+// The data-phase bit timing for `rate` at the system clock `fsys`.
+pub fn data_timing(fsys: Int, rate: Int, sample_permille: Int) -> Mcp2518Timing
+    timing_solve(fsys, rate, sample_permille, 3, 49, 1, 32, 16)
+
+// CiNBTCFG for a timing: BRP in bits 31:24, TSEG1 in 23:16, TSEG2 in 14:8
+// and SJW in 6:0, each less one.
+pub fn nbt_bits(t: Mcp2518Timing) -> Int
+    ((t.brp - 1) << 24) | ((t.tseg1 - 1) << 16) | ((t.tseg2 - 1) << 8) | (t.sjw - 1)
+
+// CiDBTCFG for a timing: BRP in bits 31:24, TSEG1 in 20:16, TSEG2 in 11:8
+// and SJW in 3:0, each less one.
+pub fn dbt_bits(t: Mcp2518Timing) -> Int
+    ((t.brp - 1) << 24) | ((t.tseg1 - 1) << 16) | ((t.tseg2 - 1) << 8) | (t.sjw - 1)
+
+// The nominal timing a CiNBTCFG value holds.
+pub fn nbt_of(raw: Int) -> Mcp2518Timing
+    Mcp2518Timing { brp: ((raw >> 24) & 0xFF) + 1, tseg1: ((raw >> 16) & 0xFF) + 1,
+                    tseg2: ((raw >> 8) & 0x7F) + 1, sjw: (raw & 0x7F) + 1 }
+
+// The data timing a CiDBTCFG value holds.
+pub fn dbt_of(raw: Int) -> Mcp2518Timing
+    Mcp2518Timing { brp: ((raw >> 24) & 0xFF) + 1, tseg1: ((raw >> 16) & 0x1F) + 1,
+                    tseg2: ((raw >> 8) & 0xF) + 1, sjw: (raw & 0xF) + 1 }
+
+// The bit rate a timing makes at the system clock `fsys`, in bits a second.
+pub fn timing_rate(fsys: Int, t: Mcp2518Timing) -> Int
+    fsys / (t.brp * (1 + t.tseg1 + t.tseg2))
+
+// CiTDC for a data rate and its timing: automatic transmitter delay
+// compensation for 1 Mbit/s and up, with the offset the manual gives, BRP
+// times TSEG1 in system clocks (Section 3.4.8) and at most 63; otherwise
+// compensation off.
+pub fn tdc_bits(data_rate: Int, t: Mcp2518Timing) -> Int
+    if data_rate < 1000000
+        return 0
+    var offset = t.brp * t.tseg1
+    if offset > 63
+        offset = 63
+    (2 << 16) | (offset << 8)
+
+// The registers of the bit timings the sheet's two crystals make at the
+// common rates, at an 80 % sample point: the system clock, the rate, and
+// CiNBTCFG (or CiDBTCFG for the data rates).  0 when the table has no row.
+// The solver gives the same values; the table is the reference they are
+// checked against.
+//
+//   40 MHz   500 kbit/s  0x003E0F0F    1 Mbit/s  0x001E0707
+//   20 MHz   500 kbit/s  0x001E0707    1 Mbit/s  0x000E0303
+//   40 MHz   2 Mbit/s    0x000E0303    5 Mbit/s  0x00040101
+//   20 MHz   2 Mbit/s    0x00060101    5 Mbit/s  0x00010000
+//
+// ```novo
+// use mcp2518fd
+//
+// fn main() [io]
+//     println("${mcp2518fd.timing_known(40000000, 500000)}")   // 4067087
+// ```
+pub fn timing_known(fsys: Int, rate: Int) -> Int
+    if fsys == 40000000
+        if rate == 500000
+            return 0x003E0F0F
+        if rate == 1000000
+            return 0x001E0707
+        if rate == 2000000
+            return 0x000E0303
+        if rate == 5000000
+            return 0x00040101
+    if fsys == 20000000
+        if rate == 500000
+            return 0x001E0707
+        if rate == 1000000
+            return 0x000E0303
+        if rate == 2000000
+            return 0x00060101
+        if rate == 5000000
+            return 0x00010000
+    0
+
+// The SPI clock safe before the oscillator is ready: 17/40 of the
+// oscillator.
+pub fn spi_safe_hz(osc_hz: Int) -> Int
+    osc_hz * SAFE_NUM / SAFE_DEN
+
+// The SPI clock for the system clock `sysclk` once it is stable: the
+// request, limited to 17/40 of the system clock and to 20 MHz.
+pub fn spi_hz_for(sysclk: Int, request: Int) -> Int
+    var hz = request
+    let limit = sysclk * SAFE_NUM / SAFE_DEN
+    if hz > limit
+        hz = limit
+    if hz > SPI_MAX_HZ
+        hz = SPI_MAX_HZ
+    hz
+
+// ── Message objects ──────────────────────────────────────────────────
+
+// The T0 or R0 word for an identifier: the standard identifier in bits
+// 10:0, or for an extended identifier its top 11 bits there and its low 18
+// bits in 28:11.
+//
+// ```novo
+// use mcp2518fd
+//
+// fn main() [io]
+//     println("${mcp2518fd.id_word(0x123, false)}")         // 291
+//     println("${mcp2518fd.id_word(0x1FFFFFFF, true)}")     // 536870911
+// ```
+pub fn id_word(id: Int, extended: Bool) -> Int
+    if not extended
+        return id & 0x7FF
+    ((id >> 18) & 0x7FF) | ((id & 0x3FFFF) << 11)
+
+// The identifier a T0 or R0 word holds.
+pub fn id_of_word(w: Int, extended: Bool) -> Int
+    let sid = w & 0x7FF
+    if not extended
+        return sid
+    (sid << 18) | ((w >> 11) & 0x3FFFF)
+
+// The T1 word of a transmit object.
+pub fn header_word(dlc: Int, extended: Bool, remote: Bool, fd: Bool, brs: Bool, esi: Bool,
+                   seq: Int) -> Int
+    var w = dlc & 0xF
+    if extended
+        w = w | 0x10
+    if remote
+        w = w | 0x20
+    if brs
+        w = w | 0x40
+    if fd
+        w = w | 0x80
+    if esi
+        w = w | 0x100
+    w | ((seq & 0x7FFFFF) << 9)
+
+// The bytes of a payload of `len` bytes as the part stores them: whole
+// words.
+pub fn padded_words(len: Int) -> Int
+    (len + 3) / 4
+
+// ── SPI instructions, over any link ──────────────────────────────────
+
+// The two header bytes of an instruction.
+fn head(var tx: SpiBuf, cmd: Int, addr: Int)
+    let _ = tx.push((cmd | ((addr >> 8) & 0x0F)) as u8)
+    let _ = tx.push((addr & 0xFF) as u8)
+
+// One little-endian word appended to a buffer.
+fn put_word(var tx: SpiBuf, v: Int)
+    let _ = tx.push((v & 0xFF) as u8)
+    let _ = tx.push(((v >> 8) & 0xFF) as u8)
+    let _ = tx.push(((v >> 16) & 0xFF) as u8)
+    let _ = tx.push(((v >> 24) & 0xFF) as u8)
+
+// The little-endian word at `at` in a buffer.
+fn word_at(b: SpiBuf, at: Int) -> Int
+    b[at] as Int | (b[at + 1] as Int << 8) | (b[at + 2] as Int << 16) | (b[at + 3] as Int << 24)
+
+// READ: `n` bytes from `addr` into `dst`.
+pub fn regs_read<L: FdLink>(l: L, addr: Int, n: Int, var dst: SpiBuf) -> Bool [hw]
+    var tx: SpiBuf = Vec.new()
+    head(var tx, CMD_READ, addr)
+    l.link_xfer(tx, n, var dst)
+
+// One 32-bit register, or `None` when the wiring has no chip select.  A bus
+// no part drives reads 0xFFFFFFFF or 0, which callers that must tell the
+// difference check for.
+pub fn reg_read<L: FdLink>(l: L, addr: Int) -> ?Int [hw]
+    var b: SpiBuf = Vec.new()
+    if not regs_read(l, addr, 4, var b)
+        return None
+    Some(word_at(b, 0))
+
+// One byte of a register.
+pub fn byte_read<L: FdLink>(l: L, addr: Int) -> ?Int [hw]
+    var b: SpiBuf = Vec.new()
+    if not regs_read(l, addr, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// WRITE: one 32-bit register.  Whether the wiring has a chip select; the
+// part acknowledges nothing.
+pub fn reg_write<L: FdLink>(l: L, addr: Int, v: Int) -> Bool [hw]
+    var tx: SpiBuf = Vec.new()
+    head(var tx, CMD_WRITE, addr)
+    put_word(var tx, v)
+    var none: SpiBuf = Vec.new()
+    l.link_xfer(tx, 0, var none)
+
+// WRITE: one byte of a register.  The bit fields of IOCON are written
+// this way.
+pub fn byte_write<L: FdLink>(l: L, addr: Int, v: Int) -> Bool [hw]
+    var tx: SpiBuf = Vec.new()
+    head(var tx, CMD_WRITE, addr)
+    let _ = tx.push((v & 0xFF) as u8)
+    var none: SpiBuf = Vec.new()
+    l.link_xfer(tx, 0, var none)
+
+// WRITE: the two bytes of `v` at `addr`, low byte first.
+fn half_write<L: FdLink>(l: L, addr: Int, v: Int) -> Bool [hw]
+    var tx: SpiBuf = Vec.new()
+    head(var tx, CMD_WRITE, addr)
+    let _ = tx.push((v & 0xFF) as u8)
+    let _ = tx.push(((v >> 8) & 0xFF) as u8)
+    var none: SpiBuf = Vec.new()
+    l.link_xfer(tx, 0, var none)
+
+// RESET.
+fn reset_instruction<L: FdLink>(l: L) -> Bool [hw]
+    var tx: SpiBuf = Vec.new()
+    let _ = tx.push(0)
+    let _ = tx.push(0)
+    var none: SpiBuf = Vec.new()
+    l.link_xfer(tx, 0, var none)
+
+// ── Modes ────────────────────────────────────────────────────────────
+
+// The operating mode in CiCON.OPMOD, 0 to 7, or `None`.
+pub fn mode_read<L: FdLink>(l: L) -> ?Int [hw]
+    let Some(v) = byte_read(l, REG_CON + 2) else return None
+    Some(v >> 5)
+
+// Whether OPMOD shows the mode `want` within the time a mode change takes
+// (see MODE_TRIES).  The first read is made at once.
+fn mode_wait<L: FdLink>(l: L, want: Int) -> Bool [hw]
+    for _i in 0..MODE_TRIES
+        if mode_read(l) == Some(want)
+            return true
+        l.link_wait(MODE_STEP_US)
+    false
+
+// Requests a mode in CiCON.REQOP (byte 3) and waits until OPMOD shows it.
+// A request for Configuration mode also sets ABAT, which aborts the frames
+// waiting to be sent.  Whether the part is in the mode.
+pub fn mode_set<L: FdLink>(l: L, mode: Int) -> Bool [hw]
+    if mode < 0 or mode > 7
+        return false
+    var v = mode
+    if mode == MCP_MODE_CONFIG
+        v = v | 0x08
+    if not byte_write(l, REG_CON + 3, v)
+        return false
+    mode_wait(l, mode)
+
+// Resets the part: Configuration mode is requested, because RESET is only
+// valid there, then the RESET instruction is sent, and CiCON is polled
+// until it reads its reset value.  Whether the part answered as a reset
+// part.
+pub fn reset<L: FdLink>(l: L) -> Bool [hw]
+    if not byte_write(l, REG_CON + 3, 0x0C)
+        return false
+    if not reset_instruction(l)
+        return false
+    l.link_wait(RESET_WAIT_US)
+    for _i in 0..RESET_TRIES
+        if reg_read(l, REG_CON) == Some(CON_RESET)
+            return true
+        l.link_wait(RESET_STEP_US)
+    false
+
+// ── The oscillator and the pins ──────────────────────────────────────
+
+// The system clock the part runs from, read from OSC: the oscillator times
+// 10 with the PLL, divided by 2 with SCLKDIV; 0 when the part does not
+// answer.
+pub fn sysclk_read<L: FdLink>(l: L, osc_hz: Int) -> Int [hw]
+    let Some(v) = reg_read(l, REG_OSC) else return 0
+    var hz = osc_hz
+    if (v & 0x01) != 0
+        hz = hz * 10
+    if (v & 0x10) != 0
+        hz = hz / 2
+    hz
+
+// Starts the oscillator: OSC written with the PLL and CLKO divider of 10
+// off, then read until OSCRDY (and PLLRDY with the PLL) shows, up to 100 ms;
+// with the PLL a further 200 us for the clock to settle.  Whether the clock
+// came up.  Written in Configuration mode.
+pub fn osc_start<L: FdLink>(l: L, pll: Bool) -> Bool [hw]
+    var v = 0
+    var want = 0x0400
+    if pll
+        v = 1
+        want = 0x0500
+    if not reg_write(l, REG_OSC, v)
+        return false
+    for _i in 0..OSC_TRIES
+        let Some(r) = reg_read(l, REG_OSC) else return false
+        if (r & want) == want
+            if pll
+                l.link_wait(PLL_SETTLE_US)
+            return true
+        l.link_wait(OSC_STEP_US)
+    false
+
+// Writes IOCON with single-byte writes: byte 3 selects the INT0 and INT1
+// outputs (PM0 and PM1 clear) or the GPIO function (set), byte 0 leaves both
+// GPIO pins inputs and the transceiver standby control off.
+fn iocon_init<L: FdLink>(l: L, int_pins: Bool) -> Bool [hw]
+    var pm = 0x03
+    if int_pins
+        pm = 0x00
+    if not byte_write(l, REG_IOCON + 3, pm)
+        return false
+    byte_write(l, REG_IOCON, 0x03)
+
+// Makes GPIO pin 0 or 1 a pin of the part's own: the pin function is set to
+// GPIO and the direction to input or output.  The other pin keeps its
+// direction.  Whether the part took it.
+pub fn gpio_mode<L: FdLink>(l: L, pin: Int, output: Bool) -> Bool [hw]
+    if pin < 0 or pin > 1
+        return false
+    let Some(pm) = byte_read(l, REG_IOCON + 3) else return false
+    let Some(tris) = byte_read(l, REG_IOCON) else return false
+    var dir = tris & ~(1 << pin)
+    if not output
+        dir = dir | (1 << pin)
+    if not byte_write(l, REG_IOCON + 3, pm | (1 << pin))
+        return false
+    byte_write(l, REG_IOCON, dir)
+
+// Drives the latch of GPIO pin 0 or 1 (IOCON byte 1).
+pub fn gpio_set<L: FdLink>(l: L, pin: Int, level: Int) -> Bool [hw]
+    if pin < 0 or pin > 1
+        return false
+    let Some(lat) = byte_read(l, REG_IOCON + 1) else return false
+    var v = lat & ~(1 << pin)
+    if level != 0
+        v = v | (1 << pin)
+    byte_write(l, REG_IOCON + 1, v)
+
+// The level of GPIO pin 0 or 1 (IOCON byte 2), or -1.
+pub fn gpio_get<L: FdLink>(l: L, pin: Int) -> Int [hw]
+    if pin < 0 or pin > 1
+        return -1
+    let Some(v) = byte_read(l, REG_IOCON + 2) else return -1
+    (v >> pin) & 1
+
+// ── ECC and the message RAM ──────────────────────────────────────────
+
+// Enables the ECC logic (ECCCON.ECCEN) and writes zeros to the whole message
+// RAM, 64 bytes at a time, so that every word has its parity bits before
+// any object is read (Reference Manual, Example 3-2).  Whether the part took
+// every write.  Written in Configuration mode.
+pub fn ram_init<L: FdLink>(l: L) -> Bool [hw]
+    if not byte_write(l, REG_ECCCON, 0x01)
+        return false
+    for k in 0..RAM_SIZE / 64
+        var tx: SpiBuf = Vec.new()
+        head(var tx, CMD_WRITE, RAM_START + 64 * k)
+        for _j in 0..16
+            put_word(var tx, 0)
+        var none: SpiBuf = Vec.new()
+        if not l.link_xfer(tx, 0, var none)
+            return false
+    true
+
+// The ECC status: the address of the last error in bits 27:16, the
+// single-error flag in bit 1 and the double-error flag in bit 2; `None` when
+// the part did not answer.
+pub fn ecc_status<L: FdLink>(l: L) -> ?Int [hw]
+    reg_read(l, REG_ECCSTAT)
+
+// The device ID register: the ID in bits 7:4 and the revision in bits 3:0.
+// The sheet gives no values, so it is reported and not tested.
+pub fn devid_read<L: FdLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_read(l, REG_DEVID) else return None
+    Some(v & 0xFF)
+
+// ── Open ─────────────────────────────────────────────────────────────
+
+// The retransmission field of a transmit FIFO's control register for the
+// `retries` setting: TXAT in bits 22:21.
+fn txat_bits(retries: Int) -> Int
+    if retries == 1
+        return 1 << 21
+    if retries == 2
+        return 0
+    2 << 21
+
+// CiTEFCON: 8 objects, reset.
+fn tefcon_bits() -> Int
+    ((TEF_DEPTH - 1) << 24) | 0x0400
+
+// CiTXQCON: 64-byte payload, 4 objects, the retransmission field, priority
+// 1 and a reset.
+fn txqcon_bits(retries: Int) -> Int
+    (7 << 29) | ((TXQ_DEPTH - 1) << 24) | txat_bits(retries) | (1 << 16) | 0x0400
+
+// CiFIFOCON1 as the receive FIFO: 64-byte payload, 16 objects, not-empty
+// and overflow interrupts, reset.
+fn rxcon_bits() -> Int
+    (7 << 29) | ((RXF_DEPTH - 1) << 24) | 0x0400 | 0x08 | 0x01
+
+// CiFIFOCON2 as a transmit FIFO: TXEN, 64-byte payload, 4 objects, the
+// retransmission field, priority 0, reset.
+fn txfcon_bits(retries: Int) -> Int
+    (7 << 29) | ((TXF_DEPTH - 1) << 24) | txat_bits(retries) | 0x0400 | 0x80
+
+// Writes the layout, the timing and the filter 0 of `open_code`, in
+// Configuration mode: CiCON, the bit timings, the transmit-delay
+// compensation, the four FIFOs and the filter; the codes are those of
+// `open_code`.
+fn open_regs<L: FdLink>(l: L, nbt: Mcp2518Timing, dbt: Mcp2518Timing, data_rate: Int,
+                        c: Mcp2518Config) -> Int [hw]
+    var con = CON_BASE
+    if c.retries != 0
+        con = con | CON_RTXAT
+    if not reg_write(l, REG_CON, con)
+        return -1
+    if not reg_write(l, REG_NBTCFG, nbt_bits(nbt))
+        return -1
+    if reg_read(l, REG_NBTCFG) != Some(nbt_bits(nbt))
+        return -4
+    if data_rate > 0
+        if not reg_write(l, REG_DBTCFG, dbt_bits(dbt))
+            return -1
+        if not reg_write(l, REG_TDC, tdc_bits(data_rate, dbt))
+            return -1
+        if reg_read(l, REG_DBTCFG) != Some(dbt_bits(dbt))
+            return -4
+    if not reg_write(l, REG_TEFCON, tefcon_bits())
+        return -1
+    if not reg_write(l, REG_TXQCON, txqcon_bits(c.retries))
+        return -1
+    if not reg_write(l, REG_FIFOCON1, rxcon_bits())
+        return -1
+    if not reg_write(l, REG_FIFOCON2, txfcon_bits(c.retries))
+        return -1
+    if c.accept_all
+        if not filter_set(l, 0, 0, 0, false, true, 1)
+            return -1
+    0
+
+// ── Filters ──────────────────────────────────────────────────────────
+
+// The CiFLTOBJn word for an identifier: the T0 layout and EXIDE (bit 30) for
+// an extended identifier (Register 3-33).
+pub fn filter_word(id: Int, extended: Bool) -> Int
+    var w = id_word(id, extended)
+    if extended
+        w = w | 0x40000000
+    w
+
+// The CiMASKn word for an identifier mask: the T0 layout and MIDE (bit 30)
+// when the type of the frame has to match EXIDE (Register 3-34).
+pub fn mask_word(mask: Int, extended: Bool, match_type: Bool) -> Int
+    var w = id_word(mask, extended)
+    if match_type
+        w = w | 0x40000000
+    w
+
+// Whether a register read answered `want`.
+//
+// workaround(a-comparison-of-an-optional-with-some-of-a-local-leaks-one-object-when-the-callee-holds-a-vec):
+// the read-back is compared through a function of the optional and the value;
+// `reg_read(...) != Some(obj)` with `obj` a local leaks one object per call.
+fn holds(read: ?Int, want: Int) -> Bool
+    match read
+        Some(v) => v == want
+        None    => false
+
+// Writes filter `n`, 0 to 31, to pass the frames whose identifier matches
+// `id` under `mask` into the receive FIFO `fifo`, 1 to 31, and enables it.
+// The filter is disabled first, because its object, mask and pointer can
+// only be changed while it is off (Register 3-32, Note 1), and the object and
+// mask are read back.  `extended` selects the type of frame it matches;
+// `all_types` clears MIDE so that the filter passes standard and extended
+// frames alike.  Whether the part holds it.
+pub fn filter_set<L: FdLink>(l: L, n: Int, id: Int, mask: Int, extended: Bool, all_types: Bool,
+                             fifo: Int) -> Bool [hw]
+    if n < 0 or n > 31 or fifo < 1 or fifo > 31
+        return false
+    let con = REG_FLTCON0 + n / 4 * 4 + n % 4
+    if not byte_write(l, con, 0)
+        return false
+    let obj = filter_word(id, extended)
+    let msk = mask_word(mask, extended, not all_types)
+    if not reg_write(l, REG_FLTOBJ0 + 8 * n, obj)
+        return false
+    if not reg_write(l, REG_MASK0 + 8 * n, msk)
+        return false
+    if not holds(reg_read(l, REG_FLTOBJ0 + 8 * n), obj)
+        return false
+    if not holds(reg_read(l, REG_MASK0 + 8 * n), msk)
+        return false
+    byte_write(l, con, 0x80 | fifo)
+
+// Disables filter `n`.
+pub fn filter_clear<L: FdLink>(l: L, n: Int) -> Bool [hw]
+    if n < 0 or n > 31
+        return false
+    byte_write(l, REG_FLTCON0 + n / 4 * 4 + n % 4, 0)
+
+// ── Interrupts ───────────────────────────────────────────────────────
+
+// The interrupt register: the flags in bits 15:0 and the enables in 31:16,
+// or `None`.
+pub fn int_read<L: FdLink>(l: L) -> ?Int [hw]
+    reg_read(l, REG_INT)
+
+// The flags alone: `INT_*` bits, or -1 when the part did not answer.
+pub fn int_flags<L: FdLink>(l: L) -> Int [hw]
+    let Some(v) = int_read(l) else return -1
+    v & 0xFFFF
+
+// Enables the flags in `mask` (`INT_*` bits) and disables the rest: the
+// enable of a flag is the bit 16 above it, and the two bytes are written
+// together.  Whether the part took it.
+pub fn int_enable<L: FdLink>(l: L, mask: Int) -> Bool [hw]
+    half_write(l, REG_INT + 2, mask)
+
+// Clears the flags in `mask` that software can clear: the invalid message,
+// wake, CAN error, system error, mode change and time base flags.  The
+// others follow the state of a FIFO or the error logic and clear with it.
+// Writing 1 to a flag has no effect, so the bytes are written with the
+// cleared bits at 0.  Whether the part took it.
+pub fn int_clear<L: FdLink>(l: L, mask: Int) -> Bool [hw]
+    if (mask & 0xFF00) != 0
+        if not byte_write(l, REG_INT + 1, 0xFF & ~(mask >> 8))
+            return false
+    if (mask & 0x00FF) != 0
+        return byte_write(l, REG_INT, 0xFF & ~mask)
+    true
+
+// The level of the INT pin, 0 when asserted, or -1 for a wiring with none.
+pub fn irq_level<L: FdLink>(l: L) -> Int [hw]
+    l.link_irq()
+
+// ── Transmit ─────────────────────────────────────────────────────────
+
+// The registers of the transmit queue (queue 0) or the transmit FIFO (queue
+// 1): the control register's address.
+fn queue_con(queue: Int) -> Int
+    if queue == 0
+        return REG_TXQCON
+    REG_FIFOCON2
+
+// The status register's address of a queue: the control register's + 4.
+fn queue_sta(queue: Int) -> Int
+    queue_con(queue) + 4
+
+// Reads the status and user address of a queue in one 8-byte read and
+// answers the offset of the object the next frame goes to: -1 when the part
+// did not answer, -2 when the queue is full.
+fn tx_slot<L: FdLink>(l: L, queue: Int) -> Int [hw]
+    var b: SpiBuf = Vec.new()
+    if not regs_read(l, queue_sta(queue), 8, var b)
+        return -1
+    if (b[0] as Int & 1) == 0
+        return -2
+    word_at(b, 4)
+
+// Writes the object in `tx` (its header already holding the address) and
+// then sets UINC and TXREQ together in the control register's byte 1.  0 on
+// success, -1 when the part did not answer.
+fn tx_commit<L: FdLink>(l: L, queue: Int, tx: SpiBuf) -> Int [hw]
+    var none: SpiBuf = Vec.new()
+    if not l.link_xfer(tx, 0, var none)
+        return -1
+    if not byte_write(l, queue_con(queue) + 1, 0x03)
+        return -1
+    0
+
+// Queues a classic frame in the transmit queue (`queue` 0) or the transmit
+// FIFO (1) with the sequence number `seq`, which comes back in the transmit
+// event.  0 on success; -1 when the part did not answer; -2 when the queue is
+// full; -3 when the frame is not valid.  A remote frame carries no data
+// words.
+pub fn send_classic<L: FdLink>(l: L, queue: Int, f: CanBusFrame, seq: Int) -> Int [hw]
+    if queue != 0 and queue != 1 or not embedded_hal.can_frame_valid(f)
+        return -3
+    let slot = tx_slot(l, queue)
+    if slot < 0
+        return slot
+    var tx: SpiBuf = Vec.new()
+    head(var tx, CMD_WRITE, RAM_START + slot)
+    put_word(var tx, id_word(f.id, f.extended))
+    put_word(var tx, header_word(f.len, f.extended, f.remote, false, false, false, seq))
+    if not f.remote
+        for i in 0..padded_words(f.len) * 4
+            let _ = tx.push(embedded_hal.can_byte(f, i) as u8)
+    tx_commit(l, queue, tx)
+
+// Queues an FD or classic frame whose header is `f` and whose payload is the
+// first `f.len` bytes of `data`, as `send_classic` does.  The object is written
+// in whole words, the last word padded with zeros.  -3 when the length is not
+// one the format encodes (0 to 8, 12, 16, 20, 24, 32, 48 and 64), the
+// identifier is too wide, the payload is shorter than the length, a remote
+// frame has the FD flag, a classic frame has more than 8 bytes, or BRS is set
+// without FD.
+pub fn send_fd<L: FdLink>(l: L, queue: Int, f: CanFdFrame, var data: Vec[u8; 64],
+                          seq: Int) -> Int [hw]
+    if queue != 0 and queue != 1
+        return -3
+    let extended = (f.flags & canframe.CAN_FLAG_EXTENDED) != 0
+    let remote = (f.flags & canframe.CAN_FLAG_RTR) != 0
+    let fd = (f.flags & canframe.CAN_FD_FLAG_FD) != 0
+    let brs = (f.flags & canframe.CAN_FD_FLAG_BRS) != 0
+    let esi = (f.flags & canframe.CAN_FD_FLAG_ESI) != 0
+    var top = 0x7FF
+    if extended
+        top = 0x1FFFFFFF
+    if f.id < 0 or f.id > top or not canframe.fd_len_is_valid(f.len)
+        return -3
+    if fd and remote or not fd and f.len > 8 or brs and not fd
+        return -3
+    if not remote and data.len() < f.len
+        return -3
+    let slot = tx_slot(l, queue)
+    if slot < 0
+        return slot
+    var dlc = f.len
+    if fd
+        dlc = canframe.fd_dlc(f)
+    var tx: SpiBuf = Vec.new()
+    head(var tx, CMD_WRITE, RAM_START + slot)
+    put_word(var tx, id_word(f.id, extended))
+    put_word(var tx, header_word(dlc, extended, remote, fd, brs, esi, seq))
+    if not remote
+        for i in 0..padded_words(f.len) * 4
+            if i < f.len
+                let _ = tx.push(data[i])
+            else
+                let _ = tx.push(0)
+    tx_commit(l, queue, tx)
+
+// Aborts every frame waiting to be sent (CiCON.ABAT) and waits for the part
+// to clear the bit.  Whether it did.
+pub fn tx_abort_all<L: FdLink>(l: L) -> Bool [hw]
+    let Some(con) = byte_read(l, REG_CON + 3) else return false
+    if not byte_write(l, REG_CON + 3, con | 0x08)
+        return false
+    for _i in 0..MODE_TRIES
+        let Some(v) = byte_read(l, REG_CON + 3) else return false
+        if (v & 0x08) == 0
+            return true
+        l.link_wait(MODE_STEP_US)
+    false
+
+// The transmit requests: bit 0 the queue, bit 2 the FIFO 2; 0 when nothing
+// waits to be sent, -1 when the part did not answer.
+pub fn tx_pending<L: FdLink>(l: L) -> Int [hw]
+    let Some(v) = reg_read(l, REG_TXREQ) else return -1
+    v & 0x7
+
+// Whether no frame waits to be sent and the part is open.
+pub fn tx_idle<L: FdLink>(l: L) -> Bool [hw]
+    let Some(m) = mode_read(l) else return false
+    if m == MCP_MODE_CONFIG
+        return false
+    tx_pending(l) == 0
+
+// ── Receive ──────────────────────────────────────────────────────────
+
+// The length a receive object's DLC means: for FD frames the table's length,
+// for classic ones at most 8.  A remote frame's length is the one it asks for
+// and it carries no payload.
+fn rx_len(dlc: Int, fd: Bool) -> Int
+    if fd
+        return canframe.fd_len_for_dlc(dlc)
+    canframe.classic_len_for_dlc(dlc)
+
+// Reads the oldest frame of the receive FIFO into a header and `data`: the
+// payload in the first bytes of `data`.  `can-nv`'s conventions answer the
+// header: `fd_none()` when the FIFO is empty, and `fd_fault(
+// CAN_FAULT_DISCONNECTED)` when the part did not answer.  The FD flag of the
+// header is set for FD frames and clear for classic ones; the frame's BRS and
+// ESI bits are flags too.  The tail is incremented after the object is read.
+pub fn fd_receive<L: FdLink>(l: L, var data: Vec[u8; 64]) -> CanFdFrame [hw]
+    data.clear()
+    var st: SpiBuf = Vec.new()
+    if not regs_read(l, REG_FIFOSTA1, 8, var st)
+        return canframe.fd_fault(canframe.CAN_FAULT_DISCONNECTED)
+    if (st[0] as Int & 1) == 0
+        return canframe.fd_none()
+    let addr = RAM_START + word_at(st, 4)
+    var hdr: SpiBuf = Vec.new()
+    if not regs_read(l, addr, 16, var hdr)
+        return canframe.fd_fault(canframe.CAN_FAULT_DISCONNECTED)
+    let r0 = word_at(hdr, 0)
+    let r1 = word_at(hdr, 4)
+    let extended = (r1 & 0x10) != 0
+    let remote = (r1 & 0x20) != 0
+    let brs = (r1 & 0x40) != 0
+    let fd = (r1 & 0x80) != 0
+    let esi = (r1 & 0x100) != 0
+    let len = rx_len(r1 & 0xF, fd)
+    var payload = len
+    if remote
+        payload = 0
+    var flags = 0
+    if extended
+        flags = flags | canframe.CAN_FLAG_EXTENDED
+    if remote
+        flags = flags | canframe.CAN_FLAG_RTR
+    if fd
+        flags = flags | canframe.CAN_FD_FLAG_FD
+    if brs
+        flags = flags | canframe.CAN_FD_FLAG_BRS
+    if esi
+        flags = flags | canframe.CAN_FD_FLAG_ESI
+    for i in 0..payload
+        if i < 8
+            let _ = data.push(hdr[8 + i])
+    if payload > 8
+        var more: SpiBuf = Vec.new()
+        if not regs_read(l, addr + 16, padded_words(payload) * 4 - 8, var more)
+            return canframe.fd_fault(canframe.CAN_FAULT_DISCONNECTED)
+        for i in 0..payload - 8
+            let _ = data.push(more[i])
+    if not byte_write(l, REG_FIFOCON1 + 1, 0x01)
+        return canframe.fd_fault(canframe.CAN_FAULT_DISCONNECTED)
+    CanFdFrame { id: id_of_word(r0, extended), flags: flags, len: len }
+
+// The oldest classic frame of the receive FIFO, or `None`.  A frame in FD
+// format cannot be a `CanBusFrame`, so it is read, dropped and the next one
+// is tried, up to the depth of the FIFO.
+pub fn receive_frame<L: FdLink>(l: L) -> ?CanBusFrame [hw]
+    var data: Vec[u8; 64] = Vec.new()
+    for _i in 0..RXF_DEPTH
+        let h = fd_receive(l, var data)
+        if not canframe.fd_is_frame(h)
+            return None
+        if (h.flags & canframe.CAN_FD_FLAG_FD) == 0
+            var packed = 0
+            for k in 0..data.len()
+                packed = packed | (data[k] as Int << (8 * k))
+            return Some(CanBusFrame { id: h.id, extended: (h.flags & canframe.CAN_FLAG_EXTENDED) != 0,
+                                     remote: (h.flags & canframe.CAN_FLAG_RTR) != 0, len: h.len, data: packed })
+    None
+
+// What `receive_frame` does after the INT pin has been read: no SPI
+// transaction while the pin is high.  A wiring with no INT pin reads the
+// FIFO.
+pub fn receive_irq<L: FdLink>(l: L) -> ?CanBusFrame [hw]
+    if l.link_irq() == 1
+        return None
+    receive_frame(l)
+
+// ── The transmit event FIFO ──────────────────────────────────────────
+
+// A transmitted frame as the transmit event FIFO reports it: the frame's
+// identifier, the `can-nv` flags and length (in bytes) of its header, and
+// the sequence number the program gave it.  `seq` is -1 when the FIFO is
+// empty and -2 when the part did not answer.
+pub @value
+struct Mcp2518Event
+    id: Int
+    flags: Int
+    len: Int
+    seq: Int
+
+// Reads the oldest transmit event and increments the FIFO's tail (CiTEFCON
+// byte 1, bit 0).  The events exist because CiCON.STEF is set.
+pub fn tef_read<L: FdLink>(l: L) -> Mcp2518Event [hw]
+    var st: SpiBuf = Vec.new()
+    if not regs_read(l, REG_TEFSTA, 8, var st)
+        return Mcp2518Event { id: 0, flags: 0, len: 0, seq: -2 }
+    if (st[0] as Int & 1) == 0
+        return Mcp2518Event { id: 0, flags: 0, len: 0, seq: -1 }
+    var obj: SpiBuf = Vec.new()
+    if not regs_read(l, RAM_START + word_at(st, 4), 8, var obj)
+        return Mcp2518Event { id: 0, flags: 0, len: 0, seq: -2 }
+    let t0 = word_at(obj, 0)
+    let t1 = word_at(obj, 4)
+    let extended = (t1 & 0x10) != 0
+    let fd = (t1 & 0x80) != 0
+    var flags = 0
+    if extended
+        flags = flags | canframe.CAN_FLAG_EXTENDED
+    if (t1 & 0x20) != 0
+        flags = flags | canframe.CAN_FLAG_RTR
+    if fd
+        flags = flags | canframe.CAN_FD_FLAG_FD
+    if (t1 & 0x40) != 0
+        flags = flags | canframe.CAN_FD_FLAG_BRS
+    if (t1 & 0x100) != 0
+        flags = flags | canframe.CAN_FD_FLAG_ESI
+    if not byte_write(l, REG_TEFCON + 1, 0x01)
+        return Mcp2518Event { id: 0, flags: 0, len: 0, seq: -2 }
+    Mcp2518Event { id: id_of_word(t0, extended), flags: flags, len: rx_len(t1 & 0xF, fd),
+                   seq: (t1 >> 9) & 0x7FFFFF }
+
+// ── Errors ───────────────────────────────────────────────────────────
+
+// The error counters and the fault confinement state from CiTREC: the
+// transmit counter in bits 15:8, the receive counter in 7:0, bus-off in bit
+// 21 and error-passive in bits 20 and 19.  `None` when the part did not
+// answer.
+pub fn errors_read<L: FdLink>(l: L) -> ?CanBusErrors [hw]
+    let Some(v) = reg_read(l, REG_TREC) else return None
+    var state = embedded_hal.CAN_ERROR_ACTIVE
+    if (v & 0x180000) != 0
+        state = embedded_hal.CAN_ERROR_PASSIVE
+    if (v & 0x200000) != 0
+        state = embedded_hal.CAN_BUS_OFF
+    Some(CanBusErrors { tx: (v >> 8) & 0xFF, rx: v & 0xFF, state: state })
+
+// What `CanBus.errors` answers: the counters, and a part in Configuration
+// mode, where CiTREC reads bus-off because the module is not on the bus
+// (Register 3-20), as error-active with zero counters.
+pub fn errors_or_idle<L: FdLink>(l: L) -> CanBusErrors [hw]
+    let idle = CanBusErrors { tx: 0, rx: 0, state: embedded_hal.CAN_ERROR_ACTIVE }
+    let Some(m) = mode_read(l) else return idle
+    if m == MCP_MODE_CONFIG
+        return idle
+    match errors_read(l)
+        Some(e) => e
+        None    => idle
+
+// The nominal bit rate the part runs at, read back from CiNBTCFG and the
+// system clock from OSC; 0 in Configuration mode or when the part did not
+// answer.
+pub fn bitrate_read<L: FdLink>(l: L, osc_hz: Int) -> Int [hw]
+    let Some(m) = mode_read(l) else return 0
+    if m == MCP_MODE_CONFIG
+        return 0
+    let Some(raw) = reg_read(l, REG_NBTCFG) else return 0
+    let fsys = sysclk_read(l, osc_hz)
+    if fsys <= 0
+        return 0
+    timing_rate(fsys, nbt_of(raw))
+
+// ── Open ─────────────────────────────────────────────────────────────
+
+// Opens the part for a nominal rate `bitrate` and a data rate `data_rate`
+// (0 for classic frames only) at an oscillator of `osc_hz` with the settings
+// `c`.  The timing is found first, so a rate the oscillator cannot make is
+// refused before the bus is touched.  Then the bus is made ready at the safe
+// clock, the part is reset and confirmed, the oscillator is started, the bus
+// clock raised, the pins and the layout written, ECC enabled and the RAM
+// cleared, the interrupts enabled, and the mode requested and confirmed.
+//
+// Answers 0 when the part took everything; -1 when it does not answer or the
+// wiring has no chip select; -2 for a mode other than 0, 2, 3, 5, 6 and 7 or
+// a retry setting outside 0 to 2; -3 for a rate the oscillator cannot make;
+// -4 when a bit timing did not read back as written; -5 when the mode did not
+// take within 50 ms; -6 when the oscillator did not come up.
+pub fn open_code<L: FdLink>(l: L, osc_hz: Int, bitrate: Int, data_rate: Int,
+                            c: Mcp2518Config) -> Int [hw]
+    if c.mode < 0 or c.mode > 7 or c.mode == MCP_MODE_SLEEP or c.mode == MCP_MODE_CONFIG or c.retries < 0 or c.retries > 2
+        return -2
+    var fsys = osc_hz
+    if c.pll
+        fsys = osc_hz * 10
+    let nbt = nominal_timing(fsys, bitrate, c.sample_nominal)
+    if nbt.brp == 0
+        return -3
+    var dbt = timing_none()
+    if data_rate > 0
+        dbt = data_timing(fsys, data_rate, c.sample_data)
+        if dbt.brp == 0
+            return -3
+    if not l.link_setup(spi_safe_hz(osc_hz))
+        return -1
+    if not reset(l)
+        return -1
+    if not osc_start(l, c.pll)
+        return -6
+    if not l.link_setup(spi_hz_for(fsys, c.spi_hz))
+        return -1
+    if not iocon_init(l, c.int_pins)
+        return -1
+    let code = open_regs(l, nbt, dbt, data_rate, c)
+    if code != 0
+        return code
+    if not ram_init(l)
+        return -1
+    if not int_enable(l, c.irq_mask)
+        return -1
+    if not mode_set(l, c.mode)
+        return -5
+    0
+
+// What `CanBus.open` does: `mode` is `CAN_MODE_NORMAL`, which runs Normal CAN
+// 2.0 mode, or `CAN_MODE_LOOPBACK`, which runs internal loopback, with the
+// bit rate on both phases classic and the other settings the defaults.
+// Whether the part took them.
+pub fn open_simple<L: FdLink>(l: L, osc_hz: Int, bitrate: Int, mode: Int) -> Bool [hw]
+    var c = config_default()
+    if mode == 0
+        c = Mcp2518Config { mode: MCP_MODE_NORMAL_20, pll: c.pll, spi_hz: c.spi_hz, retries: c.retries,
+                            accept_all: c.accept_all, irq_mask: c.irq_mask, int_pins: c.int_pins,
+                            sample_nominal: c.sample_nominal, sample_data: c.sample_data }
+    elif mode == 1
+        c = Mcp2518Config { mode: MCP_MODE_LOOPBACK, pll: c.pll, spi_hz: c.spi_hz, retries: c.retries,
+                            accept_all: c.accept_all, irq_mask: c.irq_mask, int_pins: c.int_pins,
+                            sample_nominal: c.sample_nominal, sample_data: c.sample_data }
+    else
+        return false
+    open_code(l, osc_hz, bitrate, 0, c) == 0
+
+// ── The part on a board's SPI bus ────────────────────────────────────
+
+// The link over a board's SPI bus, GPIO and timer.  The wiring names the
+// chip-select pin (`w.cs`) and the INT pin (`w.irq`), and the bus.
+pub @value
+struct Mcp2518Link
+    bus: BoardSpi
+    pins: BoardGpio
+    timer: BoardTimer
+    w: DeviceWiring
+
+// One SPI transaction over the traits, so a test runs it over a double of
+// the bus: CS low, the bytes of `tx`, `n` bytes read into `dst` while 0 is
+// clocked out, CS high.  `dst` is emptied first.  Answers `false` for a
+// wiring with no chip select or an `n` larger than `dst` holds, and drives
+// no pin then.
+pub fn spi_exchange<B: SpiBus, G: GpioOut>(bus: B, pins: G, w: DeviceWiring, tx: SpiBuf, n: Int,
+                                           var dst: SpiBuf) -> Bool [hw]
+    dst.clear()
+    let Some(cs) = w.cs else return false
+    if n > dst.capacity()
+        return false
+    pins.set(cs, 0)
+    for b in tx
+        let _ = bus.transfer(b as Int)
+    for _i in 0..n
+        let _ = dst.push(bus.transfer(0) as u8)
+    pins.set(cs, 1)
+    true
+
+// Makes the bus and the pins ready: chip select driven high first, then an
+// output, so the pin never drives low until a transaction; the INT pin an
+// input with a pull-up, since the line is open-drain and active low; the bus
+// at `hz` in mode 0.  Answers whether the wiring has a chip select.
+pub fn spi_ready<B: SpiBus, G: GpioOut>(bus: B, pins: G, w: DeviceWiring, hz: Int) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    pins.set(cs, 1)
+    pins.mode(cs, 1)
+    if let Some(irq) = w.irq
+        pins.mode(irq, 2)
+    bus.init(hz, 0)
+    true
+
+// The level of the INT pin, 1 or 0, or -1 for a wiring with no interrupt
+// pin.
+pub fn irq_level_of<G: GpioOut>(pins: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    pins.get(irq)
+
+impl FdLink for Mcp2518Link
+    fn link_xfer(self, tx: SpiBuf, n: Int, var dst: SpiBuf) -> Bool [hw]
+        spi_exchange(self.bus, self.pins, self.w, tx, n, var dst)
+
+    fn link_wait(self, us: Int) [hw]
+        self.timer.delay_us(us)
+
+    fn link_irq(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    fn link_setup(self, hz: Int) -> Bool [hw]
+        spi_ready(self.bus, self.pins, self.w, hz)
+
+// An MCP2518FD on a board's SPI bus with the chip select `w.cs`, and the
+// oscillator it runs from.
+pub @value
+struct Mcp2518
+    link: Mcp2518Link
+    osc_hz: Int
+
+impl Mcp2518
+    // The part with the chip select `w.cs` (and the INT pin `w.irq`, if the
+    // wiring has one) on the board's SPI bus, with a crystal of `osc_hz`
+    // (20 or 40 MHz, or 4 MHz with the PLL), as a board's device table
+    // builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring, osc_hz: Int) -> Mcp2518
+        Mcp2518 { link: Mcp2518Link { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w },
+                  osc_hz: osc_hz }
+
+    // The link, for the functions of this module that take one.
+    fn as_link(self) -> Mcp2518Link
+        self.link
+
+    // Opens the part for a nominal rate and a data rate with the settings
+    // `c`: the code of `open_code`.
+    fn open_with(self, bitrate: Int, data_rate: Int, c: Mcp2518Config) -> Int [hw]
+        open_code(self.link, self.osc_hz, bitrate, data_rate, c)
+
+    // Queues a classic frame in the queue (0) or the FIFO (1): the code of
+    // `send_classic`.
+    fn send_in(self, queue: Int, f: CanBusFrame, seq: Int) -> Int [hw]
+        send_classic(self.link, queue, f, seq)
+
+    // Queues an FD frame: the code of `send_fd`.
+    fn send_fd_in(self, queue: Int, f: CanFdFrame, var data: Vec[u8; 64], seq: Int) -> Int [hw]
+        send_fd(self.link, queue, f, var data, seq)
+
+    // The oldest frame of either format, with its payload in `data`.
+    fn receive_fd(self, var data: Vec[u8; 64]) -> CanFdFrame [hw]
+        fd_receive(self.link, var data)
+
+    // The classic frame waiting, read by the INT pin first.
+    fn receive_by_pin(self) -> ?CanBusFrame [hw]
+        receive_irq(self.link)
+
+    // The oldest transmit event.
+    fn event(self) -> Mcp2518Event [hw]
+        tef_read(self.link)
+
+    // The mode the part is in, 0 to 7.
+    fn mode(self) -> ?Int [hw]
+        mode_read(self.link)
+
+    // Requests a mode and waits for it.
+    fn set_mode(self, mode: Int) -> Bool [hw]
+        mode_set(self.link, mode)
+
+    // A filter and its clearing.
+    fn set_filter(self, n: Int, id: Int, mask: Int, extended: Bool, all_types: Bool,
+                  fifo: Int) -> Bool [hw]
+        filter_set(self.link, n, id, mask, extended, all_types, fifo)
+
+    fn clear_filter(self, n: Int) -> Bool [hw]
+        filter_clear(self.link, n)
+
+    // The interrupt flags, their enables and the clearing of the flags that
+    // software clears.
+    fn flags(self) -> Int [hw]
+        int_flags(self.link)
+
+    fn enable_flags(self, mask: Int) -> Bool [hw]
+        int_enable(self.link, mask)
+
+    fn clear_flags(self, mask: Int) -> Bool [hw]
+        int_clear(self.link, mask)
+
+    // The level of the INT pin, 0 when asserted, -1 with no pin.
+    fn int_level(self) -> Int [hw]
+        irq_level(self.link)
+
+    // Aborts every frame waiting to be sent.
+    fn abort_all(self) -> Bool [hw]
+        tx_abort_all(self.link)
+
+    // The part's own GPIO pins 0 and 1.
+    fn gpio_dir(self, pin: Int, output: Bool) -> Bool [hw]
+        gpio_mode(self.link, pin, output)
+
+    fn gpio_write(self, pin: Int, level: Int) -> Bool [hw]
+        gpio_set(self.link, pin, level)
+
+    fn gpio_read(self, pin: Int) -> Int [hw]
+        gpio_get(self.link, pin)
+
+    // The ECC status and the device ID register.
+    fn ecc(self) -> ?Int [hw]
+        ecc_status(self.link)
+
+    fn devid(self) -> ?Int [hw]
+        devid_read(self.link)
+
+impl CanBus for Mcp2518
+    // Opens the part at `bitrate` in Normal CAN 2.0 or internal loopback
+    // mode with the default settings (`open_simple`).
+    fn open(self, bitrate: Int, mode: Int) -> Bool [hw]
+        open_simple(self.link, self.osc_hz, bitrate, mode)
+
+    // Queues a classic frame in the transmit queue, which sends the lowest
+    // identifier first (`send_classic`).
+    fn send(self, f: CanBusFrame) -> Bool [hw]
+        send_classic(self.link, 0, f, 0) >= 0
+
+    fn receive(self) -> ?CanBusFrame [hw]
+        receive_frame(self.link)
+
+    // Whether no frame waits to be sent, and the part is open.
+    fn tx_done(self) -> Bool [hw]
+        tx_idle(self.link)
+
+    fn bitrate(self) -> Int [hw]
+        bitrate_read(self.link, self.osc_hz)
+
+    fn errors(self) -> CanBusErrors [hw]
+        errors_or_idle(self.link)
