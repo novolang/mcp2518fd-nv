@@ -29,9 +29,9 @@ main    = "src/main.nv"
 
 [dependencies]
 mcp2518fd-nv     = { path = "$PKG" }
-devices-nv      = "^0.3.3"
-embedded-hal-nv = "^0.3.3"
-can-nv          = "^0.1.3"
+devices-nv      = { path = "$PKG/../devices-nv" }
+embedded-hal-nv = { path = "$PKG/../embedded-hal-nv" }
+can-nv          = { path = "$PKG/../can-nv" }
 EOF
 
 fail=0

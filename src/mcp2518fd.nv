@@ -92,7 +92,7 @@
 // implements over a board's handles and a test implements over a double of
 // the part.
 
-use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut, Timer, CanBus, CanBusFrame, CanBusErrors }
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, SpiBus, GpioOut, Timer, CanBus, CanBusFrame, CanBusFdFrame, CanBusErrors }
 use dev_bus.{ DeviceWiring }
 use canframe
 use canframe.{ CanFdFrame }
@@ -1234,23 +1234,200 @@ pub fn open_code<L: FdLink>(l: L, osc_hz: Int, bitrate: Int, data_rate: Int,
         return -5
     0
 
+// The settings of `config_default` with the mode `mode`, an `MCP_MODE_*`
+// value.
+fn config_in(mode: Int) -> Mcp2518Config
+    let c = config_default()
+    Mcp2518Config { mode: mode, pll: c.pll, spi_hz: c.spi_hz, retries: c.retries,
+                    accept_all: c.accept_all, irq_mask: c.irq_mask, int_pins: c.int_pins,
+                    sample_nominal: c.sample_nominal, sample_data: c.sample_data }
+
+// The `MCP_MODE_*` value of the trait's `mode`: `CAN_MODE_NORMAL` is Normal
+// CAN FD mode when the program opens for FD and Normal CAN 2.0 mode when it
+// does not, and `CAN_MODE_LOOPBACK` is internal loopback.  -1 for any other
+// value.
+pub fn simple_mode(mode: Int, fd: Bool) -> Int
+    if mode == embedded_hal.CAN_MODE_NORMAL
+        if fd
+            return MCP_MODE_NORMAL_FD
+        return MCP_MODE_NORMAL_20
+    if mode == embedded_hal.CAN_MODE_LOOPBACK
+        return MCP_MODE_LOOPBACK
+    -1
+
 // What `CanBus.open` does: `mode` is `CAN_MODE_NORMAL`, which runs Normal CAN
 // 2.0 mode, or `CAN_MODE_LOOPBACK`, which runs internal loopback, with the
 // bit rate on both phases classic and the other settings the defaults.
 // Whether the part took them.
 pub fn open_simple<L: FdLink>(l: L, osc_hz: Int, bitrate: Int, mode: Int) -> Bool [hw]
-    var c = config_default()
-    if mode == 0
-        c = Mcp2518Config { mode: MCP_MODE_NORMAL_20, pll: c.pll, spi_hz: c.spi_hz, retries: c.retries,
-                            accept_all: c.accept_all, irq_mask: c.irq_mask, int_pins: c.int_pins,
-                            sample_nominal: c.sample_nominal, sample_data: c.sample_data }
-    elif mode == 1
-        c = Mcp2518Config { mode: MCP_MODE_LOOPBACK, pll: c.pll, spi_hz: c.spi_hz, retries: c.retries,
-                            accept_all: c.accept_all, irq_mask: c.irq_mask, int_pins: c.int_pins,
-                            sample_nominal: c.sample_nominal, sample_data: c.sample_data }
-    else
+    let m = simple_mode(mode, false)
+    if m < 0
         return false
-    open_code(l, osc_hz, bitrate, 0, c) == 0
+    open_code(l, osc_hz, bitrate, 0, config_in(m)) == 0
+
+// What `CanBus.open_fd` does: the nominal rate `bitrate`, the data rate
+// `data_rate` and `mode` as `CanBus.open` has it, except that
+// `CAN_MODE_NORMAL` runs Normal CAN FD mode.  A data rate of 0 or less is
+// refused, since it would open the part for classic frames only.  Whether the
+// part took them.
+pub fn open_fd_simple<L: FdLink>(l: L, osc_hz: Int, bitrate: Int, data_rate: Int,
+                                 mode: Int) -> Bool [hw]
+    let m = simple_mode(mode, true)
+    if m < 0 or data_rate <= 0
+        return false
+    open_code(l, osc_hz, bitrate, data_rate, config_in(m)) == 0
+
+// The `CAN_OPEN_*` value for a code `open_code` answered: 0 is
+// `CAN_OPEN_OK`, -1 (the part does not answer) is `CAN_OPEN_NO_CONTROLLER`,
+// -2 (a mode or a retry setting the part does not have) is `CAN_OPEN_MODE`,
+// -3 (a rate the oscillator cannot make) is `CAN_OPEN_RATE`, and the others
+// (a timing that did not read back, a mode that did not take, an oscillator
+// that did not come up) are `CAN_OPEN_NOT_READY`.
+pub fn open_cause(code: Int) -> Int
+    if code == 0
+        return embedded_hal.CAN_OPEN_OK
+    if code == -1
+        return embedded_hal.CAN_OPEN_NO_CONTROLLER
+    if code == -2
+        return embedded_hal.CAN_OPEN_MODE
+    if code == -3
+        return embedded_hal.CAN_OPEN_RATE
+    embedded_hal.CAN_OPEN_NOT_READY
+
+// What `CanBus.open_error` answers.  The driver keeps no state, so it cannot
+// recall why an open was refused; it looks at the part instead.  A bus that
+// reads all zeros or all ones, or no wiring, is `CAN_OPEN_NO_CONTROLLER`; a
+// part in Configuration mode is `CAN_OPEN_NOT_READY`; any other mode is
+// `CAN_OPEN_OK`.  A rate or a mode refused before the bus was touched leaves
+// no trace in the part, so `open_cause` of the code `open_with` answers is
+// the way to learn it.
+pub fn open_state<L: FdLink>(l: L) -> Int [hw]
+    let Some(con) = reg_read(l, REG_CON) else return embedded_hal.CAN_OPEN_NO_CONTROLLER
+    if con == 0 or con == 0xFFFFFFFF
+        return embedded_hal.CAN_OPEN_NO_CONTROLLER
+    if ((con >> 21) & 0x7) == MCP_MODE_CONFIG
+        return embedded_hal.CAN_OPEN_NOT_READY
+    embedded_hal.CAN_OPEN_OK
+
+// ── The CanBus trait's FD frame, priority and interrupt forms ────────
+
+// The `can-nv` header of an FD frame: the FD flag always, and the extended,
+// BRS and ESI flags of the frame.
+pub fn fd_header_of(f: CanBusFdFrame) -> CanFdFrame
+    var flags = canframe.CAN_FD_FLAG_FD
+    if f.extended
+        flags = flags | canframe.CAN_FLAG_EXTENDED
+    if f.brs
+        flags = flags | canframe.CAN_FD_FLAG_BRS
+    if f.esi
+        flags = flags | canframe.CAN_FD_FLAG_ESI
+    CanFdFrame { id: f.id, flags: flags, len: f.len }
+
+// The trait's FD frame of a `can-nv` header.
+pub fn bus_fd_of(h: CanFdFrame) -> CanBusFdFrame
+    CanBusFdFrame { id: h.id, extended: (h.flags & canframe.CAN_FLAG_EXTENDED) != 0,
+                    brs: (h.flags & canframe.CAN_FD_FLAG_BRS) != 0,
+                    esi: (h.flags & canframe.CAN_FD_FLAG_ESI) != 0, len: h.len }
+
+// What `CanBus.send_fd` does: the frame and its first `f.len` bytes of
+// `data` into the transmit queue with the sequence number 0.  A frame that
+// `can_fd_frame_valid` refuses is not sent.  Whether the part took it.
+pub fn send_fd_frame<L: FdLink>(l: L, f: CanBusFdFrame, data: Vec[u8; 64]) -> Bool [hw]
+    if not embedded_hal.can_fd_frame_valid(f)
+        return false
+    var d = data
+    send_fd(l, 0, fd_header_of(f), var d, 0) >= 0
+
+// What `CanBus.receive_fd` does: the oldest FD frame of the receive FIFO with
+// its bytes in `data`.  A frame in classic format cannot be a
+// `CanBusFdFrame`, so it is read, dropped and the next one is tried, up to the
+// depth of the FIFO, as `receive_frame` does for an FD frame.  `None`, with
+// `data` empty, when the FIFO holds none or the part did not answer.
+pub fn receive_fd_frame<L: FdLink>(l: L, var data: Vec[u8; 64]) -> ?CanBusFdFrame [hw]
+    for _i in 0..RXF_DEPTH
+        let h = fd_receive(l, var data)
+        if not canframe.fd_is_frame(h)
+            data.clear()
+            return None
+        if (h.flags & canframe.CAN_FD_FLAG_FD) != 0
+            return Some(bus_fd_of(h))
+    data.clear()
+    None
+
+// The transmit queue (0) or the transmit FIFO (1) for a priority of
+// `CanBus.send_priority`.  The part has two levels: the queue, which has the
+// higher priority (CiTXQCON.TXPRI is 1) and sends the lowest identifier
+// first, and the FIFO (TXPRI 0), which sends in the order of the frames.
+// Priority 0 is the FIFO and 1 to 31 is the queue; -1 outside 0 to 31, the
+// width of the TXPRI field.
+pub fn priority_queue(priority: Int) -> Int
+    if priority < 0 or priority > 31
+        return -1
+    if priority == 0
+        return 1
+    0
+
+// What `CanBus.send_priority` does: the classic frame into the queue
+// `priority_queue` names.  Whether the part took it.
+pub fn send_priority_frame<L: FdLink>(l: L, f: CanBusFrame, priority: Int) -> Bool [hw]
+    let q = priority_queue(priority)
+    if q < 0
+        return false
+    send_classic(l, q, f, 0) >= 0
+
+// The `CAN_INT_*` bits of the `INT_*` flags of CiINT: `CAN_INT_RX` is the
+// receive flag, `CAN_INT_TX` the transmit and transmit event flags,
+// `CAN_INT_ERROR` the CAN bus, system, invalid message, ECC and SPI CRC
+// errors, `CAN_INT_OVERFLOW` the receive overflow, and `CAN_INT_BUS_OFF` is
+// never set here, since the flags do not say it (see `interrupt_flags_of`).
+pub fn can_int_of(flags: Int) -> Int
+    var r = 0
+    if (flags & INT_RXIF) != 0
+        r = r | embedded_hal.CAN_INT_RX
+    if (flags & (INT_TXIF | INT_TEFIF)) != 0
+        r = r | embedded_hal.CAN_INT_TX
+    if (flags & (INT_CERRIF | INT_SERRIF | INT_IVMIF | INT_ECCIF | INT_SPICRCIF)) != 0
+        r = r | embedded_hal.CAN_INT_ERROR
+    if (flags & INT_RXOVIF) != 0
+        r = r | embedded_hal.CAN_INT_OVERFLOW
+    r
+
+// The `INT_*` flags that the `CAN_INT_*` bits of `mask` stand for, the
+// inverse of `can_int_of`; `CAN_INT_BUS_OFF` is the CAN bus error flag.
+pub fn int_flags_of(mask: Int) -> Int
+    var r = 0
+    if (mask & embedded_hal.CAN_INT_RX) != 0
+        r = r | INT_RXIF
+    if (mask & embedded_hal.CAN_INT_TX) != 0
+        r = r | INT_TXIF | INT_TEFIF
+    if (mask & embedded_hal.CAN_INT_ERROR) != 0
+        r = r | INT_CERRIF | INT_SERRIF | INT_IVMIF | INT_ECCIF | INT_SPICRCIF
+    if (mask & embedded_hal.CAN_INT_OVERFLOW) != 0
+        r = r | INT_RXOVIF
+    if (mask & embedded_hal.CAN_INT_BUS_OFF) != 0
+        r = r | INT_CERRIF
+    r
+
+// What `CanBus.interrupt_flags` answers: the flags of CiINT as `can_int_of`
+// has them, with `CAN_INT_BUS_OFF` added when the CAN bus error flag is set and
+// CiTREC says the node is off the bus.  0 when the part did not answer.
+pub fn interrupt_flags_of<L: FdLink>(l: L) -> Int [hw]
+    let f = int_flags(l)
+    if f < 0
+        return 0
+    var r = can_int_of(f)
+    if (f & INT_CERRIF) != 0
+        let Some(e) = errors_read(l) else return r
+        if e.state == embedded_hal.CAN_BUS_OFF
+            r = r | embedded_hal.CAN_INT_BUS_OFF
+    r
+
+// What `CanBus.clear_interrupt_flags` does: `int_clear` of the flags the
+// `CAN_INT_*` bits of `mask` stand for.  The flags that follow a FIFO (receive,
+// transmit, overflow) clear with it, as `int_clear` says.  Whether the part
+// took it.
+pub fn clear_interrupt<L: FdLink>(l: L, mask: Int) -> Bool [hw]
+    int_clear(l, int_flags_of(mask))
 
 // ── The part on a board's SPI bus ────────────────────────────────────
 
@@ -1348,10 +1525,6 @@ impl Mcp2518
     fn send_fd_in(self, queue: Int, f: CanFdFrame, var data: Vec[u8; 64], seq: Int) -> Int [hw]
         send_fd(self.link, queue, f, var data, seq)
 
-    // The oldest frame of either format, with its payload in `data`.
-    fn receive_fd(self, var data: Vec[u8; 64]) -> CanFdFrame [hw]
-        fd_receive(self.link, var data)
-
     // The classic frame waiting, read by the INT pin first.
     fn receive_by_pin(self) -> ?CanBusFrame [hw]
         receive_irq(self.link)
@@ -1368,24 +1541,10 @@ impl Mcp2518
     fn set_mode(self, mode: Int) -> Bool [hw]
         mode_set(self.link, mode)
 
-    // A filter and its clearing.
-    fn set_filter(self, n: Int, id: Int, mask: Int, extended: Bool, all_types: Bool,
-                  fifo: Int) -> Bool [hw]
-        filter_set(self.link, n, id, mask, extended, all_types, fifo)
-
-    fn clear_filter(self, n: Int) -> Bool [hw]
-        filter_clear(self.link, n)
-
-    // The interrupt flags, their enables and the clearing of the flags that
-    // software clears.
-    fn flags(self) -> Int [hw]
-        int_flags(self.link)
-
+    // The enables of the interrupt flags.  The flags and their clearing are
+    // `CanBus.interrupt_flags` and `clear_interrupt_flags`.
     fn enable_flags(self, mask: Int) -> Bool [hw]
         int_enable(self.link, mask)
-
-    fn clear_flags(self, mask: Int) -> Bool [hw]
-        int_clear(self.link, mask)
 
     // The level of the INT pin, 0 when asserted, -1 with no pin.
     fn int_level(self) -> Int [hw]
@@ -1435,3 +1594,44 @@ impl CanBus for Mcp2518
 
     fn errors(self) -> CanBusErrors [hw]
         errors_or_idle(self.link)
+
+    // Opens the part for CAN FD at `nominal_bps` and `data_bps` in Normal CAN
+    // FD mode or internal loopback (`open_fd_simple`).
+    fn open_fd(self, nominal_bps: Int, data_bps: Int, mode: Int) -> Bool [hw]
+        open_fd_simple(self.link, self.osc_hz, nominal_bps, data_bps, mode)
+
+    // Queues an FD frame in the transmit queue with the sequence number 0
+    // (`send_fd_frame`); `send_fd_in` names the queue and the number.
+    fn send_fd(self, f: CanBusFdFrame, data: Vec[u8; 64]) -> Bool [hw]
+        send_fd_frame(self.link, f, data)
+
+    // The next frame in FD format (`receive_fd_frame`).
+    fn receive_fd(self, var data: Vec[u8; 64]) -> ?CanBusFdFrame [hw]
+        receive_fd_frame(self.link, var data)
+
+    // Acceptance filter `n` of the 32, into the receive FIFO, matching the
+    // identifier width `extended`: `filter_set` with `all_types` false.  Open
+    // with `accept_all` false (`open_with`), or filter 0 keeps passing every
+    // frame.
+    fn set_filter(self, n: Int, id: Int, mask: Int, extended: Bool) -> Bool [hw]
+        filter_set(self.link, n, id, mask, extended, false, 1)
+
+    fn clear_filter(self, n: Int) -> Bool [hw]
+        filter_clear(self.link, n)
+
+    // Two levels: the transmit queue and the transmit FIFO
+    // (`send_priority_frame`).
+    fn send_priority(self, f: CanBusFrame, priority: Int) -> Bool [hw]
+        send_priority_frame(self.link, f, priority)
+
+    fn interrupt_flags(self) -> Int [hw]
+        interrupt_flags_of(self.link)
+
+    fn clear_interrupt_flags(self, mask: Int) -> Bool [hw]
+        clear_interrupt(self.link, mask)
+
+    // The state of the part, not the reason the last open was refused: the
+    // trait's plain `self` cannot hold it (PERIPHERAL-DRIVER-CANDIDATES.md
+    // section 3.5, the `CanBus` row).  See `open_state` and `open_cause`.
+    fn open_error(self) -> Int [hw]
+        open_state(self.link)

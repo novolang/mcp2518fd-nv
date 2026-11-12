@@ -6,12 +6,14 @@ CAN FD Controller with SPI Interface", document DS20006027B, December 2020,
 and in the "MCP25XXFD Family Reference Manual", DS20005678E
 ([microchip.com/en-us/product/MCP2518FD](https://www.microchip.com/en-us/product/MCP2518FD)).
 The driver implements the `CanBus` trait of
-[embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv) for classic
-frames over an SPI bus, a chip-select pin and an optional interrupt pin, so a
-board with no CAN controller of its own gets a CAN bus on any SPI port.  FD
-frames, bit rate switching, the acceptance filters, the transmit FIFO, the
-transmit event FIFO, the interrupt flags and the GPIO pins are the package's
-own functions beside the trait.
+[embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv) 0.4.0 over an
+SPI bus, a chip-select pin and an optional interrupt pin, so a board with no
+CAN controller of its own gets a CAN bus on any SPI port: classic frames, FD
+frames with bit rate switching, the acceptance filters, two transmit
+priorities and the interrupt flags are trait methods.  The transmit FIFO and
+the sequence numbers of the transmit event FIFO, the choice of a queue, the
+GPIO pins and the register access are the package's own functions beside the
+trait.
 
 **Hardware: NOT VERIFIED.**  No board carries an MCP2518FD yet.  The device
 program below builds for the nRF52840 DK and the nRF54LM20 DK.  The driver's
@@ -41,13 +43,12 @@ an FD frame with the identifier 0x123, bit rate switching and 12 data bytes
 once a second, and prints every frame it receives over the board's UART:
 
 ```
-rx id=291 len=12 fd=1
+rx id=291 len=12 brs=1
 ```
 
 ```novo norun:needs-pkg
-use embedded_hal.{ BoardSpi, BoardGpio }
+use embedded_hal.{ BoardSpi, BoardGpio, CanBus }
 use dev_bus
-use canframe
 use mcp2518fd
 use mcp2518fd.{ Mcp2518 }
 
@@ -62,8 +63,7 @@ fn main() [hw]
         return
     loop
         var inb: Vec[u8; 64] = Vec.new()
-        let h = can.receive_fd(var inb)
-        if canframe.fd_is_frame(h)
+        if let Some(h) = can.receive_fd(var inb)
             hal.uart.write(str.from_int(h.id))
             hal.uart.write("\n")
         hal.timer.delay_ms(100)
@@ -82,8 +82,8 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which the program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 19,540 B | 11,690 B | 3,196 B |
-| `nrf54lm20-dk` | 20,988 B | 12,322 B | 3,172 B |
+| `nrf52840-dk` | 19,564 B | 11,710 B | 3,196 B |
+| `nrf54lm20-dk` | 21,040 B | 12,380 B | 3,172 B |
 
 The numbers are from the build's memory report.  Flash also holds the
 runtime, the compiler's support library and the program's tables.  The arena,
@@ -195,15 +195,20 @@ bus is `spi_ready` and `spi_exchange`, generic over `SpiBus` and `GpioOut`.
 |---|---|
 | `attach(bus, pins, w, osc_hz)` | the part with the chip select `w.cs` and, if the wiring has one, the INT pin `w.irq`; nothing is sent |
 | `open(bitrate, mode)` | `CanBus`: Normal CAN 2.0 mode for `CAN_MODE_NORMAL`, internal loopback for `CAN_MODE_LOOPBACK`, classic frames only |
+| `open_fd(nominal_bps, data_bps, mode)` | `CanBus`: Normal CAN FD mode for `CAN_MODE_NORMAL`, internal loopback for `CAN_MODE_LOOPBACK`, with the data phase at `data_bps`; a data rate of 0 or less is refused |
 | `open_with(bitrate, data_rate, config)` | opens with the settings of `Mcp2518Config` and answers a code, 0 for success |
 | `send(frame)`, `receive()` | `CanBus`: a classic frame into the transmit queue; the next classic frame |
+| `send_fd(frame, data)`, `receive_fd(var data)` | `CanBus`: an FD frame into the transmit queue with the sequence number 0; the next frame in FD format, with its bytes in `data` |
+| `set_filter(n, id, mask, extended)`, `clear_filter(n)` | `CanBus`: acceptance filter `n` of 32, into the receive FIFO, matching the identifier width `extended`; its removal |
+| `send_priority(frame, priority)` | `CanBus`: priority 0 into the transmit FIFO, 1 to 31 into the transmit queue, which has the higher priority |
+| `interrupt_flags()`, `clear_interrupt_flags(mask)` | `CanBus`: the `CAN_INT_*` bits of CiINT, with `CAN_INT_BUS_OFF` from CiTREC; their clearing |
+| `open_error()` | `CanBus`: `CAN_OPEN_NO_CONTROLLER` for a bus that reads zeros or ones, `CAN_OPEN_NOT_READY` for a part in Configuration mode, otherwise `CAN_OPEN_OK`; see the rules below |
 | `tx_done()`, `bitrate()`, `errors()` | `CanBus`: no frame waiting and the part open; the rate read back from CiNBTCFG and OSC; the counters and state |
 | `send_in(queue, frame, seq)`, `send_fd_in(queue, header, var payload, seq)` | a classic or an FD frame into the queue (0) or the transmit FIFO (1) with a sequence number |
-| `receive_fd(var payload)`, `receive_by_pin()` | the next frame of either format; the next classic frame, reading the INT pin first |
+| `receive_by_pin()` | the next classic frame, reading the INT pin first |
 | `event()` | the oldest transmit event: identifier, flags, length and the sequence number |
 | `mode()`, `set_mode(m)` | the mode in CiCON.OPMOD; a mode request, confirmed |
-| `set_filter(...)`, `clear_filter(n)` | an acceptance filter, and its removal |
-| `flags()`, `enable_flags(mask)`, `clear_flags(mask)`, `int_level()` | CiINT; its enables; its clearing; the INT pin |
+| `enable_flags(mask)`, `int_level()` | the enables of CiINT; the INT pin |
 | `abort_all()` | aborts every frame waiting to be sent |
 | `gpio_dir(pin, output)`, `gpio_write(pin, level)`, `gpio_read(pin)` | the part's GPIO0 and GPIO1 |
 | `ecc()`, `devid()` | the ECC status register; the device ID register |
@@ -214,14 +219,14 @@ bus is `spi_ready` and `spi_exchange`, generic over `SpiBus` and `GpioOut`.
 filter 0 passes every frame, the flags that drive the INT pin, whether
 GPIO0 and GPIO1 are the INT0 and INT1 outputs, and the two sample points.
 
-The `CanBus` trait has two modes and a `CanBusFrame` of 8 bytes; FD frames,
-Listen-Only, the filters, the transmit priorities and the interrupt flags have
-no place in it, so they are the driver's own functions beside it.  An FD
-frame's header is `can-nv`'s `CanFdFrame`, with the identifier, the flags
-(`CAN_FLAG_EXTENDED`, `CAN_FLAG_RTR`, `CAN_FD_FLAG_FD`, `CAN_FD_FLAG_BRS`,
-`CAN_FD_FLAG_ESI`) and the length, and its payload is in the caller's
-`Vec[u8; 64]`.  A receive that finds nothing answers `fd_none()`, and one
-that finds the part gone answers `fd_fault(CAN_FAULT_DISCONNECTED)`.
+The trait's `CanBusFdFrame` holds the identifier, `extended`, `brs`, `esi` and
+the length, and the bytes travel beside it in the caller's `Vec[u8; 64]`.  The
+driver's own functions, `send_fd_in`, `fd_receive` and `send_fd`, take
+`can-nv`'s `CanFdFrame`, whose flags (`CAN_FLAG_EXTENDED`, `CAN_FLAG_RTR`,
+`CAN_FD_FLAG_FD`, `CAN_FD_FLAG_BRS`, `CAN_FD_FLAG_ESI`) also describe a classic
+or a remote frame; `fd_header_of` and `bus_fd_of` convert between the two.
+`fd_receive` answers `fd_none()` when the FIFO is empty and
+`fd_fault(CAN_FAULT_DISCONNECTED)` when the part is gone.
 
 ### The awaitable form
 
@@ -268,7 +273,8 @@ tier the package checks at, which is why the form is the awaitable one.
 8. The trait's `open` runs Normal CAN 2.0 mode, in which the part answers an FD
    frame on the bus with an error frame, because the trait carries classic
    frames only.  A node on a bus that carries FD frames opens with
-   `MCP_MODE_NORMAL_FD`, through `open_with`.
+   `MCP_MODE_NORMAL_FD`, through `open_fd` or `open_with`.  `open_fd` answers
+   false for a data rate of 0 or less.
 9. The transmit queue sends the lowest identifier first among its frames; the
    transmit FIFO sends in the order frames were put in.  The queue has the
    higher priority.  `send` queues in the queue.  Both answer full when their
@@ -281,27 +287,67 @@ tier the package checks at, which is why the form is the awaitable one.
     0x400 plus the user address, and increments the tail with UINC.  A frame of
     more than 8 data bytes needs a second read.
 12. `receive` on the trait drops an FD frame, because a `CanBusFrame` holds
-    8 bytes, and tries the next, up to the depth of the FIFO.  `receive_fd`
-    returns both formats.
+    8 bytes, and tries the next, up to the depth of the FIFO.  The trait's
+    `receive_fd` drops a classic frame in the same way, since a
+    `CanBusFdFrame` has no remote frame and stands for a frame in FD format;
+    `fd_receive` returns both formats.
 13. A frame the bus does not acknowledge is sent again until it is, unless
     `retries` is 1 (three attempts) or 2 (one).  `abort_all` sets ABAT and waits
     for the part to clear it.
 14. A filter is disabled before its object, mask and FIFO pointer are written,
-    and the object and mask are read back.  `all_types` clears MIDE so the
-    filter passes standard and extended frames; otherwise the filter matches the
-    type its EXIDE says.
+    and the object and mask are read back.  The trait's `set_filter` writes a
+    filter that matches the type its `extended` says and puts the frames in
+    receive FIFO 1, the only receive FIFO.  `accept_all`, which `open` and
+    `open_fd` leave true, enables filter 0 to pass every frame, so a program
+    that filters opens with `open_with` and a config whose `accept_all` is
+    false.  The module's `filter_set` also takes `all_types`, which clears MIDE
+    so that the filter passes standard and extended frames, and a FIFO.
 15. The INT pin follows the flags of `irq_mask`.  The flags of the FIFOs
     (RXIF, TXIF, TEFIF) follow the FIFOs and clear when the FIFO is read or
     written; the others (mode change, wake, bus error, system error, invalid
-    message, time base) are cleared by `clear_flags`, which writes the bits to
-    clear as 0.
+    message, time base) are cleared by `clear_interrupt_flags`, which writes the
+    bits to clear as 0.  `interrupt_flags` folds the part's flags into five
+    bits: `CAN_INT_RX` is RXIF, `CAN_INT_TX` is TXIF or TEFIF, `CAN_INT_ERROR`
+    is a CAN bus, system, invalid message, ECC or SPI CRC error,
+    `CAN_INT_OVERFLOW` is RXOVIF, and `CAN_INT_BUS_OFF` is the CAN bus error
+    flag with CiTREC showing bus-off.  The mode change, wake, time base and
+    transmit attempt flags have no bit; `Mcp2518.enable_flags` and the module's
+    `int_flags` carry them.  A part that does not answer has no flags.
 16. In Configuration mode CiTREC reads bus-off, because the module is not on the
     bus.  `errors` answers error-active with zero counters there.
 17. The oscillator is 40, 20 or 4 MHz.  A 4 MHz crystal with the PLL runs the
     system clock at 40 MHz.
-18. `devid` returns the ID and revision byte and tests nothing.  The data sheet
+18. `send_priority` has two levels because the part has: the transmit queue,
+    whose CiTXQCON priority is 1 and which sends the lowest identifier first,
+    and the transmit FIFO, whose priority is 0 and which sends in the order of
+    the frames.  Priority 0 goes to the FIFO and 1 to 31 to the queue; a priority
+    outside 0 to 31 is refused.
+19. `open_error` cannot say why the last open was refused, because the driver
+    keeps no state.  It reads the part: a bus that reads zeros or ones is
+    `CAN_OPEN_NO_CONTROLLER`, Configuration mode is `CAN_OPEN_NOT_READY`, and any
+    other mode is `CAN_OPEN_OK`.  A rate or a mode refused before the bus was
+    touched leaves nothing to read, so after `open_with` the reason is
+    `open_cause` of the code it answered: `CAN_OPEN_RATE` for -3 and
+    `CAN_OPEN_MODE` for -2.
+20. `devid` returns the ID and revision byte and tests nothing.  The data sheet
     names the register as the way to tell the MCP2517FD from the MCP2518FD and
     gives no values.
+
+## Where the traits fall short
+
+- `open_error` is the part's state, not the reason of the last open, because
+  `CanBus` has a plain `self` and the driver keeps no state (section 3.5 of
+  `planning/PERIPHERAL-DRIVER-CANDIDATES.md`, the `CanBus` row).  `open_cause`
+  gives the reason for a code `open_with` answered.
+- `send_fd` and `send_priority` queue with the sequence number 0, which
+  `event` reports back, and `send_fd` has no way to name the transmit FIFO;
+  `send_fd_in` takes the queue and the number.
+- `CanBusFdFrame` holds an FD frame only.  A remote frame, Listen-Only and
+  Restricted operation mode, the 32 filters' FIFO choice and the filter that
+  passes both identifier widths are in the module's functions and in
+  `open_with`.
+- The async form of the trait is the awaitable INT pin above; an `async fn` is
+  refused at the embedded tier (the `*Async` traits row of the same section).
 
 ## What is not included
 

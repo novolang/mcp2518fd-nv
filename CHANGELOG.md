@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+The package takes embedded-hal-nv and devices-nv by path until 0.4.0 is
+published, and can-nv by path as well, since the published can-nv 0.1.3 asks
+the registry for embedded-hal-nv ^0.3.0 and a build takes one.  Each line
+becomes a registry range at the publish.
+
+The inherent stand-ins for the controller's FD frame, filters and interrupt
+flags are now the `CanBus` methods embedded-hal-nv 0.4.0 added:
+
+- `open_fd(nominal_bps, data_bps, mode)` is new: Normal CAN FD mode or
+  internal loopback with a data phase.  The module functions are
+  `open_fd_simple` and `simple_mode`.
+- `send_fd(frame, data)` and `receive_fd(var data)` take the trait's
+  `CanBusFdFrame`.  The inherent `receive_fd`, which answered `can-nv`'s
+  `CanFdFrame` and returned both formats, is gone; the module's `fd_receive`
+  still does that, and `fd_header_of` and `bus_fd_of` convert.  The trait's
+  `receive_fd` drops a frame in classic format, as `receive` drops one in FD
+  format.  `send_fd_in` stays, since it names the queue and the sequence
+  number.
+- `set_filter(n, id, mask, extended)` and `clear_filter(n)` replace the
+  inherent `set_filter(n, id, mask, extended, all_types, fifo)` and
+  `clear_filter(n)`.  The trait form matches the identifier width and uses
+  receive FIFO 1; `filter_set` keeps `all_types` and the FIFO.
+- `send_priority(frame, priority)` is new: priority 0 goes to the transmit
+  FIFO and 1 to 31 to the transmit queue (`priority_queue`,
+  `send_priority_frame`).
+- `interrupt_flags()` and `clear_interrupt_flags(mask)` replace the inherent
+  `flags()` and `clear_flags(mask)`.  They use the `CAN_INT_*` bits
+  (`can_int_of`, `int_flags_of`), and `interrupt_flags` answers 0, not -1,
+  when the part does not answer.  `enable_flags` stays.
+- `open_error()` is new.  It reads the part (`open_state`) and cannot recall the
+  reason of the last open; `open_cause` maps a code of `open_with` to a
+  `CAN_OPEN_*` value.
+
+The example prints `brs=` where it printed `fd=`, since every frame the trait
+receives is in FD format.
+
 ## 0.1.0
 
 The first release: a driver for Microchip's MCP2518FD external CAN FD

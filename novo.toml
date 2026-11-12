@@ -28,9 +28,13 @@ tier = "embedded"
 [dependencies]
 # The board's SPI bus, GPIO and timer handles, the SpiBus, GpioOut and
 # Timer traits they implement, and the CanBus trait this driver implements.
-embedded-hal-nv = "^0.3.3"
+# A path dependency until 0.4.0 is published: PATH-DEPENDENCIES.md in the
+# parent directory lists the line that becomes "^0.4.0".
+embedded-hal-nv = { path = "../embedded-hal-nv" }
 # The wiring record a board's device table hands `attach`.
-devices-nv      = "^0.3.3"
+devices-nv      = { path = "../devices-nv" }
 # The CAN FD frame header, the DLC tables and the "nothing arrived" and
 # "refused" values of a receive.
-can-nv          = "^0.1.3"
+# A path dependency for the same reason: the published can-nv 0.1.3 asks the
+# registry for embedded-hal-nv ^0.3.0, and a build takes one embedded-hal-nv.
+can-nv          = { path = "../can-nv" }

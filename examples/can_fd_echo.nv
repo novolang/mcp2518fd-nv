@@ -16,7 +16,7 @@
  * FD frame with the identifier 0x123, bit rate switching and 12 data bytes once
  * a second, and prints every frame it receives over the board's UART:
  *
- *     rx id=291 len=12 fd=1
+ *     rx id=291 len=12 brs=1
  *
  * Effects the program declares: [hw], for the SPI bus, the pins, the UART and
  * the timer.
@@ -26,7 +26,7 @@
  * With no part on the bus the program prints "mcp2518fd: no answer".  The part
  * has not been read on a board.
  */
-use embedded_hal.{ BoardSpi, BoardGpio }
+use embedded_hal.{ BoardSpi, BoardGpio, CanBus }
 use dev_bus
 use canframe
 use mcp2518fd
@@ -58,12 +58,11 @@ fn send_counter(can: Mcp2518, n: Int) [hw]
 @tier(embedded)
 fn print_rx(can: Mcp2518) [hw]
     var inb: Vec[u8; 64] = Vec.new()
-    let h = can.receive_fd(var inb)
-    if canframe.fd_is_frame(h)
+    if let Some(h) = can.receive_fd(var inb)
         hal.uart.write("rx")
         field(" id=", h.id)
         field(" len=", h.len)
-        field(" fd=", h.flags & canframe.CAN_FD_FLAG_FD)
+        field(" brs=", (if h.brs then 1 else 0))
         hal.uart.write("\n")
 
 // Reads the transmit events the part has kept, so that its event FIFO does not
