@@ -24,14 +24,14 @@ cp "$PKG/examples/can_fd_echo.nv" "$WORK/src/main.nv"
 cat > "$WORK/novo.toml" <<EOF
 [package]
 name    = "mcp2518fd-nv-device"
-version = "0.1.0"
+version = "0.2.0"
 main    = "src/main.nv"
 
 [dependencies]
 mcp2518fd-nv     = { path = "$PKG" }
-devices-nv      = { path = "$PKG/../devices-nv" }
-embedded-hal-nv = { path = "$PKG/../embedded-hal-nv" }
-can-nv          = { path = "$PKG/../can-nv" }
+devices-nv      = "^0.4.0"
+embedded-hal-nv = "^0.4.0"
+can-nv          = "^0.1.4"
 EOF
 
 fail=0

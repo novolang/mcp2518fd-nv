@@ -1,11 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-12
 
-The package takes embedded-hal-nv and devices-nv by path until 0.4.0 is
-published, and can-nv by path as well, since the published can-nv 0.1.3 asks
-the registry for embedded-hal-nv ^0.3.0 and a build takes one.  Each line
-becomes a registry range at the publish.
+The release depends on devices-nv 0.4.0, embedded-hal-nv 0.4.0 and can-nv 0.1.4.
 
 The inherent stand-ins for the controller's FD frame, filters and interrupt
 flags are now the `CanBus` methods embedded-hal-nv 0.4.0 added:

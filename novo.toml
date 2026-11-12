@@ -1,6 +1,6 @@
 [package]
 name        = "mcp2518fd-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for Microchip's MCP2518FD external CAN FD controller on an SPI bus: embedded-hal-nv's CanBus for classic frames with the bit timing computed from the oscillator and the rate, and for FD frames with bit rate switching, the transmit queue and a transmit FIFO, the receive FIFO, the acceptance filters, the transmit event FIFO, the interrupt flags and the INT pin, the error counters and the GPIO pins, with the bring-up the data sheet and the reference manual ask for: the SPI clock limit before the oscillator is ready, the reset, the ECC enable and the RAM initialisation."
 license     = "Apache-2.0"
 stability   = "experimental"
